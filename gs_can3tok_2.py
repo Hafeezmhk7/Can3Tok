@@ -1,26 +1,12 @@
 """
-Can3Tok Training with Projection Head Approach
-Version: 4.0 - PROJECTION HEAD ON GS_DECODER HIDDEN STATE
+Can3Tok Training - IMPROVED VERSION
+Properly handles command-line arguments and can disable semantic learning
 
-Key Changes from v3.2:
-- REMOVED: per-Gaussian feature extraction from encoder
-- ADDED: SemanticProjectionHead on GS_decoder hidden state [B, 256]
-- Projects hidden → [B, 40k, 128] for semantic loss
-- 10x less memory than geo_decoder approach
-- 20% faster training (no chunking needed)
-
-Architecture:
-  decoded_latents [B, 256, 384]
-      ↓
-  reshape + 8 MLPs
-      ↓
-  hidden [B, 256] ← Extract this!
-      ↓
-  Projection Head (3-layer MLP)
-      ↓
-  Per-Gaussian features [B, 40k, 128]
-      ↓
-  Semantic Contrastive Loss
+KEY IMPROVEMENTS:
+- Command-line args override YAML config
+- Can completely disable semantic learning
+- Automatic detection when loss weights = 0
+- Works seamlessly with SLURM job files
 """
 
 import torch
@@ -39,10 +25,18 @@ from model.michelangelo.utils.misc import get_config_from_file
 
 # Data loading
 import torch.utils.data as Data
-from scipy.stats import special_ortho_group
 
 # Semantic loss functions
 from semantic_losses import compute_semantic_loss
+
+import matplotlib.pyplot as plt
+from scipy.stats import special_ortho_group
+
+# Add these 4 lines right here:
+import sys
+sys.stdout.reconfigure(line_buffering=True)
+sys.stderr.reconfigure(line_buffering=True)
+os.environ['PYTHONUNBUFFERED'] = '1'
 
 # ============================================================================
 # UTILITY FUNCTIONS
@@ -57,11 +51,20 @@ def print_memory_stats(device):
         print(f"  💾 GPU Memory: Allocated={allocated:.2f}GB, "
               f"Reserved={reserved:.2f}GB, Peak={max_allocated:.2f}GB")
 
+# def random_rotation_matrix_gpu(device):
+#     """Generate random rotation matrix directly on GPU"""
+#     A = torch.randn(3, 3, device=device)
+#     Q, R = torch.linalg.qr(A)
+#     det_Q = torch.det(Q)
+#     if det_Q.item() < 0:
+#         Q[:, 0] *= -1
+#     return Q
+
 # ============================================================================
 # ARGUMENT PARSING
 # ============================================================================
 
-parser = argparse.ArgumentParser(description='Can3Tok Training - Projection Head Approach')
+parser = argparse.ArgumentParser(description='Can3Tok Training - IMPROVED')
 parser.add_argument('--use_wandb', action='store_true', default=False,
                     help='Enable Weights & Biases logging')
 parser.add_argument('--wandb_project', type=str, default='Can3Tok-SceneSplat',
@@ -93,7 +96,7 @@ parser.add_argument('--sampling_method', type=str, default='opacity',
                     help='Sampling method: random or opacity (default: opacity)')
 
 # Semantic loss parameters
-parser.add_argument('--segment_loss_weight', type=float, default=0.1,
+parser.add_argument('--segment_loss_weight', type=float, default=0.0,
                     help='Weight for segment-level contrastive loss (beta)')
 parser.add_argument('--instance_loss_weight', type=float, default=0.0,
                     help='Weight for instance-level contrastive loss (gamma)')
@@ -106,12 +109,30 @@ parser.add_argument('--semantic_subsample', type=int, default=2000,
 parser.add_argument('--recon_scale', type=float, default=1000.0,
                     help='Scale factor for reconstruction loss to balance gradients')
 
-# In argument parsing section, add:
-parser.add_argument('--semantic_mode', type=str, default='hidden',
-                    choices=['hidden', 'geometric', 'attention'],
-                    help='Semantic feature extraction mode')
-
+# ============================================================================
+# NEW: Semantic mode control from command line
+# ============================================================================
+parser.add_argument('--semantic_mode', type=str, default='none',
+                    choices=['none', 'hidden', 'geometric', 'attention'],
+                    help='Semantic feature extraction mode (none = disabled)')
+                    
 args = parser.parse_args()
+
+# ============================================================================
+# SMART SEMANTIC DETECTION
+# ============================================================================
+# Automatically detect if semantic learning should be enabled
+# Enable if: (1) semantic_mode != 'none' AND (2) any loss weight > 0
+semantic_requested = (args.semantic_mode != 'none')
+semantic_loss_enabled = (args.segment_loss_weight > 0 or args.instance_loss_weight > 0)
+enable_semantic = semantic_requested and semantic_loss_enabled
+
+# Override semantic_mode if no semantic loss
+if not semantic_loss_enabled:
+    effective_semantic_mode = 'none'
+    enable_semantic = False
+else:
+    effective_semantic_mode = args.semantic_mode
 
 # ============================================================================
 # WEIGHTS & BIASES SETUP
@@ -124,9 +145,9 @@ if args.use_wandb:
         
         job_id = os.environ.get('SLURM_JOB_ID', 'local')
         
-        run_name = f"can3tok_job_{job_id}_PROJECTION_HEAD"
-        if args.segment_loss_weight > 0 or args.instance_loss_weight > 0:
-            run_name += f"_semantic_beta{args.segment_loss_weight}"
+        run_name = f"can3tok_job_{job_id}_{effective_semantic_mode}"
+        if enable_semantic:
+            run_name += f"_beta{args.segment_loss_weight}"
         
         wandb_run = wandb.init(
             entity=args.wandb_entity,
@@ -134,15 +155,13 @@ if args.use_wandb:
             name=run_name,
             config={
                 "learning_rate": args.lr,
-                "architecture": "Can3Tok-ProjectionHead",
+                "architecture": "Can3Tok-Improved",
                 "dataset": "SceneSplat-7K",
                 "batch_size": args.batch_size,
                 "epochs": args.num_epochs,
                 "kl_weight": args.kl_weight,
-                "feature_extraction": "projection_head_on_hidden",
-                "hidden_dim": 256,
-                "feature_dim": 128,
-                "num_gaussians": 40000,
+                "semantic_mode": effective_semantic_mode,
+                "enable_semantic": enable_semantic,
                 "sampling_method": args.sampling_method,
                 "eval_every": args.eval_every,
                 "recon_scale": args.recon_scale,
@@ -151,7 +170,7 @@ if args.use_wandb:
                 "semantic_temperature": args.semantic_temperature,
                 "semantic_subsample": args.semantic_subsample,
             },
-            tags=["scenesplat", "projection-head", "semantic-loss", "gaussian-splatting"],
+            tags=["scenesplat", "semantic-configurable", "gaussian-splatting"],
         )
         print("✓ Weights & Biases enabled")
         wandb_enabled = True
@@ -165,7 +184,7 @@ else:
 # GPU SETUP
 # ============================================================================
 
-os.environ["CUDA_VISIBLE_DEVICES"] = '0,1,2,3,4,5,6,7'
+os.environ["CUDA_VISIBLE_DEVICES"] = '0'  # Single GPU for SLURM job
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
 # ============================================================================
@@ -194,14 +213,14 @@ sampling_method = args.sampling_method
 
 job_id = os.environ.get('SLURM_JOB_ID', None)
 if job_id:
-    checkpoint_folder = f"job_{job_id}_PROJECTION_HEAD"
-    if args.segment_loss_weight > 0 or args.instance_loss_weight > 0:
-        checkpoint_folder += f"_semantic_beta{args.segment_loss_weight}_scale{args.recon_scale}"
+    checkpoint_folder = f"job_{job_id}_{effective_semantic_mode}"
+    if enable_semantic:
+        checkpoint_folder += f"_beta{args.segment_loss_weight}"
 else:
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    checkpoint_folder = f"local_{timestamp}_PROJECTION_HEAD"
-    if args.segment_loss_weight > 0 or args.instance_loss_weight > 0:
-        checkpoint_folder += f"_semantic_beta{args.segment_loss_weight}_scale{args.recon_scale}"
+    checkpoint_folder = f"local_{timestamp}_{effective_semantic_mode}"
+    if enable_semantic:
+        checkpoint_folder += f"_beta{args.segment_loss_weight}"
 
 save_path = f"/home/yli11/scratch/Hafeez_thesis/Can3Tok/checkpoints/{checkpoint_folder}/"
 os.makedirs(save_path, exist_ok=True)
@@ -209,12 +228,13 @@ os.makedirs(save_path, exist_ok=True)
 # Save run configuration
 config_file = os.path.join(save_path, "config.txt")
 with open(config_file, 'w') as f:
-    f.write(f"Can3Tok Training Configuration - PROJECTION HEAD APPROACH\n")
+    f.write(f"Can3Tok Training Configuration - IMPROVED VERSION\n")
     f.write(f"=" * 70 + "\n")
     f.write(f"Job ID: {job_id or 'local'}\n")
     f.write(f"Timestamp: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
-    f.write(f"Feature Extraction: Projection Head on GS_decoder hidden state\n")
-    f.write(f"Architecture: hidden [B,256] → ProjectionHead → [B,40k,128]\n")
+    f.write(f"Semantic Mode: {effective_semantic_mode}\n")
+    f.write(f"Semantic Enabled: {enable_semantic}\n")
+    f.write(f"Command-line args override YAML: YES\n")
     f.write(f"Device: {device}\n")
     f.write(f"Batch size: {bch_size}\n")
     f.write(f"Epochs: {num_epochs}\n")
@@ -229,109 +249,110 @@ with open(config_file, 'w') as f:
     f.write(f"Sampling method: {sampling_method}\n")
     f.write(f"=" * 70 + "\n")
 
+print(f"\n{'='*70}")
+print(f"🚀 CAN3TOK TRAINING - IMPROVED VERSION")
+print(f"{'='*70}")
 print(f"Configuration:")
 print(f"  Job ID: {job_id or 'local'}")
-print(f"  VERSION: PROJECTION HEAD on GS_decoder hidden state")
-print(f"  Architecture: hidden [B,256] → 3-layer MLP → [B,40k,128]")
+print(f"  Semantic Mode (requested): {args.semantic_mode}")
+print(f"  Semantic Mode (effective): {effective_semantic_mode}")
+print(f"  Semantic Enabled: {enable_semantic}")
 
-if args.segment_loss_weight > 0 or args.instance_loss_weight > 0:
-    print(f"  🧠 SEMANTIC LOSS ENABLED:")
+if enable_semantic:
+    print(f"\n  🧠 SEMANTIC LEARNING: ✅ ENABLED")
+    print(f"     Mode: {effective_semantic_mode}")
     print(f"     Segment weight (β): {args.segment_loss_weight}")
     print(f"     Instance weight (γ): {args.instance_loss_weight}")
     print(f"     Temperature (τ): {args.semantic_temperature}")
-    print(f"     Subsample size: {args.semantic_subsample}")
-    print(f"     Recon scale: {args.recon_scale}")
+    print(f"     Subsample: {args.semantic_subsample}")
 else:
-    print(f"  Semantic loss: DISABLED")
+    print(f"\n  🧠 SEMANTIC LEARNING: ❌ DISABLED")
+    if not semantic_requested:
+        print(f"     Reason: semantic_mode='none'")
+    elif not semantic_loss_enabled:
+        print(f"     Reason: All loss weights = 0")
+    print(f"     ✓ Saves memory and computation!")
 
-print(f"  Device: {device}")
+print(f"\n  Device: {device}")
 print(f"  Batch size: {bch_size}")
 print(f"  Epochs: {num_epochs}")
 print(f"  Learning rate: {args.lr}")
 print(f"  KL weight: {kl_weight}")
-print(f"  Sampling method: {sampling_method}")
 print(f"  Save path: {save_path}")
-print()
+print(f"{'='*70}\n")
 
 # Define geometric indices GLOBALLY
 GEOMETRIC_INDICES = list(range(4, 7)) + [10] + list(range(11, 18))
-# [4,5,6] xyz + [10] opacity + [11,12,13] scale + [14,15,16,17] quat
+
+# # ============================================================================
+# # MODEL SETUP - COMMAND-LINE ARGS OVERRIDE YAML
+# # ============================================================================
+
+# print("Loading model configuration...")
+# config_path_perceiver = "./model/configs/aligned_shape_latents/shapevae-256.yaml"
+# model_config_perceiver = get_config_from_file(config_path_perceiver)
+
+# if hasattr(model_config_perceiver, "model"):
+#     model_config_perceiver = model_config_perceiver.model
+
+# # ============================================================================
+# # CRITICAL: Override YAML config with command-line arguments!
+# # ============================================================================
+# print(f"✓ Loaded YAML config")
+# print(f"✓ Overriding with command-line arguments...")
+
+# model_config_perceiver['semantic_mode'] = effective_semantic_mode
+# model_config_perceiver['enable_semantic'] = enable_semantic
+
+# print(f"   semantic_mode: {effective_semantic_mode}")
+# print(f"   enable_semantic: {enable_semantic}")
+
+# perceiver_encoder_decoder = instantiate_from_config(model_config_perceiver)
+
+# # Single GPU for SLURM (no DataParallel needed)
+# gs_autoencoder = perceiver_encoder_decoder
+# gs_autoencoder.to(device)
+
 
 # ============================================================================
-# MODEL SETUP
+# MODEL SETUP - COMMAND-LINE ARGS OVERRIDE YAML
 # ============================================================================
 
-print("Loading model with SemanticProjectionHead...")
+print("Loading model configuration...")
 config_path_perceiver = "./model/configs/aligned_shape_latents/shapevae-256.yaml"
 model_config_perceiver = get_config_from_file(config_path_perceiver)
 
-if hasattr(model_config_perceiver, "model"):
-    model_config_perceiver = model_config_perceiver.model
+print(f"✓ Loaded YAML config")
+print(f"✓ Overriding with command-line arguments...")
 
-# Add semantic_mode to config
-model_config_perceiver['semantic_mode'] = args.semantic_mode
+# Get the model config (not the entire config)
+model_config = model_config_perceiver.model
 
-perceiver_encoder_decoder = instantiate_from_config(model_config_perceiver)
+# Set semantic_mode at the correct level
+model_config.params.shape_module_cfg.params.semantic_mode = effective_semantic_mode
 
-# Multi-GPU setup
-if torch.cuda.device_count() > 1:
-    print(f"Using {torch.cuda.device_count()} GPUs")
-    gs_autoencoder = nn.DataParallel(perceiver_encoder_decoder)
-else:
-    print("Using single GPU")
-    gs_autoencoder = perceiver_encoder_decoder
+print(f"   semantic_mode: {effective_semantic_mode}")
 
+# Now instantiate using the model config
+print(f"\n{'='*70}")
+print("INSTANTIATING MODEL")
+print(f"{'='*70}")
+perceiver_encoder_decoder = instantiate_from_config(model_config)
+print(f"✓ Model instantiated successfully")
+print(f"{'='*70}\n")
+
+# Single GPU for SLURM (no DataParallel needed)
+gs_autoencoder = perceiver_encoder_decoder
 gs_autoencoder.to(device)
 
 # Optimizer
 optimizer = torch.optim.Adam(gs_autoencoder.parameters(), lr=args.lr, betas=[0.9, 0.999])
 
-# print("✓ Model loaded with SemanticProjectionHead")
+print("✓ Model loaded successfully")
 print()
 
 
-# ============================================================================
-# VERIFY SEMANTIC MODE
-# ============================================================================
-print(f"\n{'='*70}")
-print(f"VERIFYING SEMANTIC MODE:")
-print(f"  Command line argument: {args.semantic_mode}")
-print(f"  Model attribute: {getattr(gs_autoencoder, 'semantic_mode', 'NOT FOUND')}")
 
-# Force set if wrong
-if hasattr(gs_autoencoder, 'semantic_mode'):
-    current_mode = gs_autoencoder.semantic_mode
-    if current_mode != args.semantic_mode:
-        print(f"  ⚠️  MISMATCH! Model has '{current_mode}', forcing to '{args.semantic_mode}'")
-        gs_autoencoder.semantic_mode = args.semantic_mode
-        
-        # Also need to disable unused heads for memory
-        if args.semantic_mode == 'geometric':
-            print(f"  ✓ Disabling unused semantic heads for efficiency")
-            # These might not exist depending on your initialization
-            if hasattr(gs_autoencoder, 'semantic_projection_hidden'):
-                gs_autoencoder.semantic_projection_hidden = None
-            if hasattr(gs_autoencoder, 'semantic_attention_head'):
-                gs_autoencoder.semantic_attention_head = None
-        elif args.semantic_mode == 'hidden':
-            print(f"  ⚠️  Warning: Hidden mode uses 329M params!")
-            if hasattr(gs_autoencoder, 'semantic_projection_geometric'):
-                gs_autoencoder.semantic_projection_geometric = None
-            if hasattr(gs_autoencoder, 'semantic_attention_head'):
-                gs_autoencoder.semantic_attention_head = None
-        elif args.semantic_mode == 'attention':
-            print(f"  ✓ Using attention mode")
-            if hasattr(gs_autoencoder, 'semantic_projection_hidden'):
-                gs_autoencoder.semantic_projection_hidden = None
-            if hasattr(gs_autoencoder, 'semantic_projection_geometric'):
-                gs_autoencoder.semantic_projection_geometric = None
-else:
-    print(f"  ❌ CRITICAL: Model doesn't have semantic_mode attribute!")
-    # Add it manually
-    gs_autoencoder.semantic_mode = args.semantic_mode
-    print(f"  ✓ Added semantic_mode attribute manually")
-
-print(f"{'='*70}\n")
 
 # ============================================================================
 # DATASET LOADING
@@ -357,11 +378,10 @@ trainDataLoader = Data.DataLoader(
     dataset=gs_dataset_train, 
     batch_size=bch_size,
     shuffle=True, 
-    num_workers=12,
-    pin_memory=True
+    num_workers=9,  # Match SLURM cpus-per-task
+    pin_memory=True,
+    persistent_workers=True
 )
-
-
 
 # Validation dataset
 print("="*70)
@@ -381,8 +401,9 @@ valDataLoader = Data.DataLoader(
     dataset=gs_dataset_val,
     batch_size=bch_size,
     shuffle=False,
-    num_workers=12,
-    pin_memory=True
+    num_workers=9,
+    pin_memory=True,
+    persistent_workers=True
 )
 
 print("="*70)
@@ -424,12 +445,7 @@ def evaluate_model(model, dataloader, device, failure_threshold):
                 UV_gs_batch[:, :, :3]
             )
             
-            # Define geometric indices (11 params: xyz, opacity, scale, quat - NO RGB!)
             GEOMETRIC_INDICES = list(range(4, 7)) + [10] + list(range(11, 18))
-            # [4,5,6] xyz + [10] opacity + [11,12,13] scale + [14,15,16,17] quat
-
-            # In training loop:
-            # Replace target extraction:
             target = UV_gs_batch[:, :, GEOMETRIC_INDICES]
             UV_gs_recover_reshaped = UV_gs_recover.reshape(UV_gs_batch.shape[0], -1, 11)
             
@@ -455,13 +471,6 @@ def evaluate_model(model, dataloader, device, failure_threshold):
             per_scene_l2_errors.extend(per_scene_errors_scaled.cpu().numpy().tolist())
             num_failures += (per_scene_errors_scaled.cpu().numpy() > failure_threshold).sum()
             num_scenes += batch_size
-            
-            # Clean up
-            del shape_embed, mu, log_var, z, UV_gs_recover, per_gaussian_features
-            del target, UV_gs_recover_reshaped, batch_l2_error, per_scene_norms, per_scene_errors_scaled, kl_loss
-            
-            if i_batch % 2 == 0:
-                torch.cuda.empty_cache()
     
     avg_l2_error = total_l2_error / num_scenes
     avg_kl = total_kl / num_scenes
@@ -504,9 +513,11 @@ origin_offset = torch.tensor(
 # ============================================================================
 
 print("="*70)
-print("STARTING TRAINING - PROJECTION HEAD APPROACH")
-if args.segment_loss_weight > 0 or args.instance_loss_weight > 0:
-    print("🧠 SEMANTIC LOSS ENABLED (projection head features)")
+print("STARTING TRAINING")
+if enable_semantic:
+    print(f"🧠 SEMANTIC LEARNING ENABLED (mode: {effective_semantic_mode})")
+else:
+    print("🧠 SEMANTIC LEARNING DISABLED (baseline VAE training)")
 print("="*70)
 print()
 
@@ -523,23 +534,20 @@ for epoch in tqdm(range(num_epochs), desc="Training"):
     gs_autoencoder.train()
     
     for i_batch, batch_data in enumerate(trainDataLoader):
-        # Initialize to None (in case forward fails)
         per_gaussian_features = None
         
         # Extract data
         if isinstance(batch_data, dict):
             UV_gs_batch = batch_data['features'].type(torch.float32).to(device)
-            segment_labels = batch_data['segment_labels'].type(torch.int64).to(device)
-            instance_labels = batch_data['instance_labels'].type(torch.int64).to(device)
-            has_semantics = batch_data['has_semantics']
+            segment_labels = batch_data['segment_labels'].type(torch.int64).to(device) if enable_semantic else None
+            instance_labels = batch_data['instance_labels'].type(torch.int64).to(device) if enable_semantic else None
         else:
             UV_gs_batch = batch_data[0].type(torch.float32).to(device)
             segment_labels = None
             instance_labels = None
-            has_semantics = False
         
-        # Random permutation
-        if epoch % 1 == 0 and random_permute == 1:
+        # Random permutation (reduced frequency)
+        if epoch % 10 == 0 and i_batch == 0 and random_permute == 1:
             perm_indices = torch.randperm(UV_gs_batch.size()[1])
             UV_gs_batch = UV_gs_batch[:, perm_indices]
             
@@ -548,15 +556,11 @@ for epoch in tqdm(range(num_epochs), desc="Training"):
             if instance_labels is not None:
                 instance_labels = instance_labels[:, perm_indices]
         
-        # Random rotation (every 5 epochs)
         if epoch % 5 == 0 and epoch > 1 and random_rotation == 1:
             rand_rot_comp = special_ortho_group.rvs(3)
-            rand_rot = torch.tensor(
-                np.dot(rand_rot_comp, rand_rot_comp.T), 
-                dtype=torch.float32
-            ).to(UV_gs_batch.device)
-            
-            UV_gs_batch[:, :, 4:7] = UV_gs_batch[:, :, 4:7] @ rand_rot
+            rand_rot = torch.tensor(np.dot(rand_rot_comp, rand_rot_comp.T), 
+                                dtype=torch.float32).to(UV_gs_batch.device)
+            UV_gs_batch[:,:,4:7] = UV_gs_batch[:,:,4:7] @ rand_rot
             
             for bcbc in range(UV_gs_batch.shape[0]):
                 shifted_points = UV_gs_batch[bcbc, :, 4:7] + origin_offset
@@ -582,28 +586,23 @@ for epoch in tqdm(range(num_epochs), desc="Training"):
             dim=1
         ).mean()
         
-
-        target = UV_gs_batch[:, :, GEOMETRIC_INDICES]  # [B, 40k, 11]
+        target = UV_gs_batch[:, :, GEOMETRIC_INDICES]
         UV_gs_recover_reshaped = UV_gs_recover.reshape(UV_gs_batch.shape[0], -1, 11)
 
-        # Replace reconstruction loss:
         recon_loss_raw = torch.norm(
             UV_gs_recover_reshaped - target,
             p=2
         ) / UV_gs_batch.shape[0]
-
         
         recon_loss = recon_loss_raw / args.recon_scale
         
-        # Semantic contrastive loss
+        # Semantic contrastive loss (only if enabled)
         semantic_loss = torch.tensor(0.0, device=device)
         semantic_metrics = {}
         
-        if (args.segment_loss_weight > 0 or args.instance_loss_weight > 0) and \
-        segment_labels is not None and per_gaussian_features is not None:
-            
+        if enable_semantic and segment_labels is not None and per_gaussian_features is not None:
             semantic_loss, semantic_metrics = compute_semantic_loss(
-                embeddings=per_gaussian_features,  # Now [B, 40k, 32] with your change
+                embeddings=per_gaussian_features,
                 segment_labels=segment_labels,
                 instance_labels=instance_labels,
                 batch_size=UV_gs_batch.shape[0],
@@ -612,21 +611,11 @@ for epoch in tqdm(range(num_epochs), desc="Training"):
                 temperature=args.semantic_temperature,
                 subsample=args.semantic_subsample
             )
-            
-            # Free memory immediately after computing loss
-            del per_gaussian_features
-            per_gaussian_features = None  # Set to None so cleanup works
-            torch.cuda.empty_cache()
-        
-        elif per_gaussian_features is not None:
-            del per_gaussian_features
-            per_gaussian_features = None
-            torch.cuda.empty_cache()
         
         # Combined loss
         loss = recon_loss + kl_weight * KL_loss + semantic_loss
         
-        # Save values for logging (before deleting tensors)
+        # Save values for logging
         loss_value = loss.item()
         recon_loss_raw_value = recon_loss_raw.item()
         recon_loss_value = recon_loss.item()
@@ -636,17 +625,6 @@ for epoch in tqdm(range(num_epochs), desc="Training"):
         # Backward pass
         loss.backward()
         optimizer.step()
-        
-        # Memory cleanup
-        del shape_embed, mu, log_var, z, UV_gs_recover
-        del recon_loss_raw, recon_loss, KL_loss, semantic_loss, loss
-        
-        # Clean up per_gaussian_features if still exists
-        if per_gaussian_features is not None:
-            del per_gaussian_features
-        
-        if i_batch % 2 == 0:
-            torch.cuda.empty_cache()
         
         # Accumulate losses
         epoch_loss += loss_value
@@ -674,7 +652,6 @@ for epoch in tqdm(range(num_epochs), desc="Training"):
         # Print first batch
         if i_batch == 0:
             print_msg = (f"Epoch {epoch}/{num_epochs} | "
-                        f"Batch {i_batch}/{len(trainDataLoader)} | "
                         f"Loss: {loss_value:.2f} | "
                         f"Recon: {recon_loss_raw_value:.2f} | "
                         f"KL: {kl_loss_value:.2f}")
@@ -694,12 +671,11 @@ for epoch in tqdm(range(num_epochs), desc="Training"):
     val_metrics = None
     if epoch % eval_every == 0 or epoch == num_epochs - 1:
         print(f"\n{'='*70}")
-        print(f"RUNNING VALIDATION (Epoch {epoch})")
+        print(f"VALIDATION (Epoch {epoch})")
         print(f"{'='*70}")
         
         val_metrics = evaluate_model(gs_autoencoder, valDataLoader, device, failure_threshold)
         
-        print(f"Validation Results:")
         print(f"  L2 Error: {val_metrics['avg_l2_error']:.2f} ± {val_metrics['l2_std']:.2f}")
         print(f"  Failure Rate: {val_metrics['failure_rate']:.2f}%")
         
@@ -708,20 +684,16 @@ for epoch in tqdm(range(num_epochs), desc="Training"):
             best_val_loss = val_metrics['avg_l2_error']
             best_epoch = epoch
             
-            if torch.cuda.device_count() > 1:
-                model_state = gs_autoencoder.module.state_dict()
-            else:
-                model_state = gs_autoencoder.state_dict()
-            
             best_model_path = os.path.join(save_path, "best_model.pth")
             torch.save({
                 'epoch': epoch,
-                'model_state_dict': model_state,
+                'model_state_dict': gs_autoencoder.state_dict(),
                 'optimizer_state_dict': optimizer.state_dict(),
                 'val_l2_error': val_metrics['avg_l2_error'],
-                'approach': 'projection_head',
+                'semantic_mode': effective_semantic_mode,
+                'enable_semantic': enable_semantic,
             }, best_model_path)
-            print(f"  ✓ New best model saved! (L2: {best_val_loss:.2f})")
+            print(f"  ✓ New best model! (L2: {best_val_loss:.2f})")
         
         print(f"{'='*70}\n")
     
@@ -745,42 +717,18 @@ for epoch in tqdm(range(num_epochs), desc="Training"):
         
         wandb_run.log(log_dict, step=global_step)
     
-    # Print summary every 20 epochs
-    if epoch % 20 == 0:
-        print(f"\n{'='*70}")
-        print(f"EPOCH {epoch} SUMMARY")
-        print(f"{'='*70}")
-        print(f"Avg Train Loss: {avg_train_loss:.2f}")
-        print(f"Avg Train Recon: {avg_train_recon:.2f}")
-        print(f"Avg Train KL: {avg_train_kl:.2f}")
-        if avg_train_semantic > 0:
-            print(f"Avg Train Semantic: {avg_train_semantic:.4f}")
-        print(f"Best Val L2 Error: {best_val_loss:.2f} (epoch {best_epoch})")
-        if epoch % 10 == 0:
-            print_memory_stats(device)
-        print(f"{'='*70}\n")
-    
-    # Save checkpoints every 10 epochs
+    # Save checkpoints
     if epoch >= 10 and epoch % 10 == 0:
-        gs_autoencoder.eval()
-        
-        if torch.cuda.device_count() > 1:
-            model_state = gs_autoencoder.module.state_dict()
-        else:
-            model_state = gs_autoencoder.state_dict()
-        
         checkpoint_path = os.path.join(save_path, f"{int(epoch)}.pth")
         torch.save({
             'epoch': epoch,
-            'model_state_dict': model_state,
+            'model_state_dict': gs_autoencoder.state_dict(),
             'optimizer_state_dict': optimizer.state_dict(),
             'train_loss': avg_train_loss,
-            'approach': 'projection_head',
+            'semantic_mode': effective_semantic_mode,
+            'enable_semantic': enable_semantic,
         }, checkpoint_path)
-        
-        print(f"✓ Saved checkpoint: {checkpoint_path}")
-        
-        gs_autoencoder.train()
+        print(f"✓ Checkpoint saved: epoch_{epoch}.pth")
 
 # ============================================================================
 # FINAL SAVE
@@ -790,32 +738,25 @@ print("\n" + "="*70)
 print("TRAINING COMPLETE")
 print("="*70)
 
-# Final validation
 final_val_metrics = evaluate_model(gs_autoencoder, valDataLoader, device, failure_threshold)
 
-print(f"\nFinal Validation Results:")
-print(f"  L2 Error: {final_val_metrics['avg_l2_error']:.2f}")
-print(f"  Best Val L2: {best_val_loss:.2f} (epoch {best_epoch})")
-
-# Save final model
-if torch.cuda.device_count() > 1:
-    model_state = gs_autoencoder.module.state_dict()
-else:
-    model_state = gs_autoencoder.state_dict()
+print(f"\nFinal Results:")
+print(f"  Final L2: {final_val_metrics['avg_l2_error']:.2f}")
+print(f"  Best L2: {best_val_loss:.2f} (epoch {best_epoch})")
 
 final_path = os.path.join(save_path, "final.pth")
 torch.save({
     'epoch': num_epochs - 1,
-    'model_state_dict': model_state,
+    'model_state_dict': gs_autoencoder.state_dict(),
     'optimizer_state_dict': optimizer.state_dict(),
     'final_val_l2': final_val_metrics['avg_l2_error'],
     'best_val_l2': best_val_loss,
     'best_epoch': best_epoch,
-    'approach': 'projection_head',
+    'semantic_mode': effective_semantic_mode,
+    'enable_semantic': enable_semantic,
 }, final_path)
 
-print(f"✓ Final checkpoint saved: {final_path}")
-print(f"✓ Best model saved: {os.path.join(save_path, 'best_model.pth')}")
+print(f"✓ Saved: {final_path}")
 print("="*70)
 
 if wandb_enabled:
@@ -823,7 +764,7 @@ if wandb_enabled:
         "final_val_l2_error": final_val_metrics['avg_l2_error'],
         "best_val_l2_error": best_val_loss,
         "best_epoch": best_epoch,
-        "approach": "projection_head",
+        "semantic_mode": effective_semantic_mode,
+        "enable_semantic": enable_semantic,
     })
     wandb_run.finish()
-    print("✓ Weights & Biases run finished")

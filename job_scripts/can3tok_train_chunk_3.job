@@ -1,274 +1,277 @@
 #!/bin/bash
-#SBATCH --job-name=can3tok_projhead
+#SBATCH --job-name=can3tok_semantic
 #SBATCH --partition=gpu_h100
 #SBATCH --gpus=1
 #SBATCH --time=12:00:00
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=9
 #SBATCH --mem=64G
-#SBATCH --output=logs/can3tok_projhead_%j.out
-#SBATCH --error=logs/can3tok_projhead_%j.err
+#SBATCH --output=logs/can3tok_%j.out
+#SBATCH --error=logs/can3tok_%j.err
 
-echo "=========================================="
-echo "Can3Tok Training - PROJECTION HEAD"
-echo "=========================================="
+# ============================================================================
+# CAN3TOK TRAINING - FULL SEMANTIC CONTROL
+# ============================================================================
+# This job file gives you complete control over semantic learning via flags
+# No need to edit YAML files - everything controlled here!
+# ============================================================================
+
+echo "================================================================================"
+echo "               CAN3TOK TRAINING - SEMANTIC LEARNING CONTROL"
+echo "================================================================================"
 echo "Job ID: $SLURM_JOB_ID"
+echo "Node: $SLURM_NODELIST"
 echo "Start time: $(date)"
 echo ""
-echo "🎯 KEY APPROACH: Projection Head from GS_decoder Hidden State"
-echo "✓ Extract hidden [B, 256] from GS_decoder (after 8 MLPs)"
-echo "✓ Project to per-Gaussian features [B, 40k, 128] via 3-layer MLP"
-echo "✓ Apply contrastive loss on projected features"
-echo ""
-echo "🚀 ADVANTAGES over geo_decoder:"
-echo "✓ 10x less memory (2 GB vs 23 GB)"
-echo "✓ 20% faster (no chunking needed)"
-echo "✓ Simpler code (single forward pass)"
-echo "✓ Better gradient flow (direct to decoder)"
-echo "✓ Standard approach (SimCLR projection head)"
-echo ""
 
 # ============================================================================
-# Configuration
+# 🎯 SEMANTIC LEARNING CONFIGURATION - CHOOSE YOUR OPTION!
 # ============================================================================
-export WANDB_API_KEY="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"
 
-USE_WANDB=False
-BATCH_SIZE=8
-NUM_EPOCHS=200
+# ┌────────────────────────────────────────────────────────────────────────┐
+# │  UNCOMMENT THE OPTION YOU WANT TO USE                                   │
+# └────────────────────────────────────────────────────────────────────────┘
+
+# ────────────────────────────────────────────────────────────────────────────
+# OPTION 1: NO SEMANTIC LEARNING (Baseline - Fastest, Least Memory)
+# ────────────────────────────────────────────────────────────────────────────
+# Use this for: Baseline comparisons, fastest training, minimal memory
+# Memory: ~20GB | Speed: ⚡⚡⚡ Fastest | Quality: Standard reconstruction
+# ────────────────────────────────────────────────────────────────────────────
+
+SEMANTIC_MODE="none"       # Value doesn't matter when disabled
+SEGMENT_WEIGHT=0.0              # ← KEY: Set to 0 to disable
+INSTANCE_WEIGHT=0.0             # ← KEY: Set to 0 to disable
+
+# ────────────────────────────────────────────────────────────────────────────
+# OPTION 2: GEOMETRIC MODE (Recommended - Best Balance!)
+# ────────────────────────────────────────────────────────────────────────────
+# Use this for: Standard semantic learning, efficient training
+# Memory: ~20GB | Speed: ⚡⚡⚡ Fast | Quality: Good semantic features
+# Parameters: ~45K | Approach: Uses reconstructed Gaussian parameters
+# ────────────────────────────────────────────────────────────────────────────
+
+# SEMANTIC_MODE="geometric"
+# SEGMENT_WEIGHT=0.1              # ← Set > 0 to enable
+# INSTANCE_WEIGHT=0.0             # Optional: instance-level loss
+
+# ────────────────────────────────────────────────────────────────────────────
+# OPTION 3: HIDDEN STATE MODE (Best Quality - Slowest)
+# ────────────────────────────────────────────────────────────────────────────
+# Use this for: Maximum semantic quality, rich feature learning
+# Memory: ~35GB | Speed: ⚡⚡ Medium | Quality: Best semantic features
+# Parameters: ~329M | Approach: Uses decoder hidden state
+# ────────────────────────────────────────────────────────────────────────────
+
+# SEMANTIC_MODE="hidden"
+# SEGMENT_WEIGHT=0.1              # ← Set > 0 to enable
+# INSTANCE_WEIGHT=0.0             # Optional: instance-level loss
+
+# ────────────────────────────────────────────────────────────────────────────
+# OPTION 4: ATTENTION MODE (Spatial Context)
+# ────────────────────────────────────────────────────────────────────────────
+# Use this for: Learning spatial relationships between Gaussians
+# Memory: ~30GB | Speed: ⚡⚡ Medium | Quality: Good spatial features
+# Parameters: ~158M | Approach: Cross-attention between Gaussians and scene
+# ────────────────────────────────────────────────────────────────────────────
+
+# SEMANTIC_MODE="attention"
+# SEGMENT_WEIGHT=0.1              # ← Set > 0 to enable
+# INSTANCE_WEIGHT=0.0             # Optional: instance-level loss
+
+# ────────────────────────────────────────────────────────────────────────────
+# Semantic Loss Additional Parameters (only used if SEGMENT_WEIGHT > 0)
+# ────────────────────────────────────────────────────────────────────────────
+SEMANTIC_TEMP=0.07              # Temperature for InfoNCE loss
+SEMANTIC_SUBSAMPLE=2000         # Subsample Gaussians (saves memory/compute)
+
+# ============================================================================
+# TRAINING HYPERPARAMETERS
+# ============================================================================
+
+BATCH_SIZE=64
+NUM_EPOCHS=100
 LEARNING_RATE=1e-4
-KL_WEIGHT=1e-5
-
-TRAIN_SCENES=600
-VAL_SCENES=50
-SAMPLING_METHOD="opacity"
-
-# ============================================================================
-# Loss Balancing Configuration
-# ============================================================================
-RECON_SCALE=1000.0      # Keep same as before
+KL_WEIGHT=1e-4                # VAE KL divergence weight
+RECON_SCALE=1.0              # Scale reconstruction loss
+EVAL_EVERY=10                   # Evaluate every N epochs
+FAILURE_THRESHOLD=150          # L2 error threshold for failure
 
 # ============================================================================
-# Semantic Loss Configuration (Projection Head)
+# DATASET CONFIGURATION
 # ============================================================================
-SEGMENT_WEIGHT=100.0      # Start with 1.0
-INSTANCE_WEIGHT=0.0     # Keep instance disabled for now
-SEMANTIC_TEMP=0.07      # τ - Standard from SimCLR
-SEMANTIC_SUBSAMPLE=5000 # Subsample for efficiency
 
-EVAL_EVERY=20
-FAILURE_THRESHOLD=1000
+TRAIN_SCENES=600                # Number of training scenes (None = all)
+VAL_SCENES=50                   # Number of validation scenes (None = all)
+SAMPLING_METHOD="opacity"       # "opacity" or "random"
 
-WANDB_ENTITY="3D-SSC"
-WANDB_PROJECT="Can3Tok-ProjectionHead"
+# ============================================================================
+# WEIGHTS & BIASES CONFIGURATION
+# ============================================================================
 
-echo "════════════════════════════════════════"
-echo "CONFIGURATION"
-echo "════════════════════════════════════════"
+export WANDB_API_KEY="your_key_here"
+USE_WANDB=False                 # Set to True to enable W&B logging
+
+# ============================================================================
+# PRINT CONFIGURATION SUMMARY
+# ============================================================================
+
+echo "════════════════════════════════════════════════════════════════════════════════"
+echo "                        CONFIGURATION SUMMARY"
+echo "════════════════════════════════════════════════════════════════════════════════"
 echo ""
-echo "Training Parameters:"
-echo "  • Batch size: $BATCH_SIZE"
-echo "  • Epochs: $NUM_EPOCHS"
-echo "  • Learning rate: $LEARNING_RATE"
-echo "  • KL weight: $KL_WEIGHT"
-echo "  • Train scenes: $TRAIN_SCENES"
-echo "  • Val scenes: $VAL_SCENES"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Job Information
+# ─────────────────────────────────────────────────────────────────────────────
+echo "📋 JOB INFORMATION:"
+echo "   Job ID:            $SLURM_JOB_ID"
+echo "   Partition:         $SLURM_JOB_PARTITION"
+echo "   Node:              $SLURM_NODELIST"
+echo "   GPUs:              $SLURM_GPUS"
+echo "   CPUs:              $SLURM_CPUS_PER_TASK"
+echo "   Memory:            64GB"
+echo "   Time Limit:        12:00:00"
 echo ""
-echo "Loss Balancing:"
-echo "  • 🔧 Recon scale: $RECON_SCALE"
-echo "  • 📈 Expected recon: ~2500 → ~2.5 (scaled)"
-echo "  • 📈 Expected semantic: ~30 (weighted)"
-echo "  • 📈 Expected KL: ~0.01 (weighted)"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Semantic Learning Configuration
+# ─────────────────────────────────────────────────────────────────────────────
+echo "🧠 SEMANTIC LEARNING:"
+
+# Check if semantic learning is enabled
+if (( $(echo "$SEGMENT_WEIGHT > 0" | bc -l) )) || (( $(echo "$INSTANCE_WEIGHT > 0" | bc -l) )); then
+    echo "   Status:            ✅ ENABLED"
+    echo "   Mode:              ${SEMANTIC_MODE^^}"
+    echo ""
+    echo "   Loss Weights:"
+    echo "      Segment (β):    $SEGMENT_WEIGHT"
+    echo "      Instance (γ):   $INSTANCE_WEIGHT"
+    echo "      Temperature:    $SEMANTIC_TEMP"
+    echo "      Subsample:      $SEMANTIC_SUBSAMPLE Gaussians"
+    echo ""
+    
+    # Mode-specific information
+    case "$SEMANTIC_MODE" in
+        "geometric")
+            echo "   Architecture Details:"
+            echo "      Approach:       Geometric Gaussians → MLP (SimCLR-style)"
+            echo "      Input:          [B, 40k, 11] reconstructed Gaussians"
+            echo "      Output:         [B, 40k, 32] semantic features"
+            echo "      Parameters:     ~45K (very lightweight!)"
+            echo "      Memory Usage:   ~20GB GPU"
+            echo "      Training Speed: ⚡⚡⚡ Fast"
+            echo "      Best For:       ⭐ Standard semantic learning"
+            echo "      Notes:          Most efficient, recommended for most cases"
+            ;;
+        "hidden")
+            echo "   Architecture Details:"
+            echo "      Approach:       Hidden State → MLP projection"
+            echo "      Input:          [B, 1024] decoder hidden state"
+            echo "      Output:         [B, 40k, 32] semantic features"
+            echo "      Parameters:     ~329M (heavyweight)"
+            echo "      Memory Usage:   ~35GB GPU"
+            echo "      Training Speed: ⚡⚡ Medium"
+            echo "      Best For:       Maximum semantic quality"
+            echo "      Notes:          Richest features, but slower training"
+            ;;
+        "attention")
+            echo "   Architecture Details:"
+            echo "      Approach:       Cross-attention semantic head"
+            echo "      Input:          [B, 40k, 3] positions × [B, 512, 384] tokens"
+            echo "      Output:         [B, 40k, 32] semantic features"
+            echo "      Parameters:     ~158M (medium weight)"
+            echo "      Memory Usage:   ~30GB GPU"
+            echo "      Training Speed: ⚡⚡ Medium"
+            echo "      Best For:       Spatial semantic relationships"
+            echo "      Notes:          Good for capturing scene context"
+            ;;
+        *)
+            echo "      ⚠️  Unknown semantic mode: $SEMANTIC_MODE"
+            ;;
+    esac
+    
+    echo ""
+    echo "   Loss Composition:"
+    echo "      Total = (Recon / $RECON_SCALE) + ($KL_WEIGHT × KL) + Semantic"
+    echo "      Semantic = ($SEGMENT_WEIGHT × Segment) + ($INSTANCE_WEIGHT × Instance)"
+    
+else
+    # Semantic learning is disabled
+    echo "   Status:            ❌ DISABLED (Baseline)"
+    echo "   Reason:            All semantic loss weights = 0"
+    echo ""
+    echo "   Benefits:"
+    echo "      Memory Saved:   ~15GB GPU (no semantic head)"
+    echo "      Speed Gain:     ~30% faster training"
+    echo "      Use Case:       ⭐ Baseline comparisons, pure VAE"
+    echo ""
+    echo "   Loss Composition:"
+    echo "      Total = (Recon / $RECON_SCALE) + ($KL_WEIGHT × KL)"
+    echo "      (No semantic loss)"
+fi
+
 echo ""
-echo "Semantic Loss (PROJECTION HEAD!):"
-echo "  • 🎯 Source: GS_decoder hidden state [B, 256]"
-echo "  • 🔄 Projection: hidden → [B, 40k, 128]"
-echo "  • 🏗️ Architecture: 3-layer MLP (256→1024→2048→5.12M)"
-echo "  • 💾 Parameters: ~13M (reasonable)"
-echo "  • 📊 Memory overhead: ~2 GB (vs 23 GB for geo_decoder!)"
-echo "  • Segment weight (β): $SEGMENT_WEIGHT"
-echo "  • Instance weight (γ): $INSTANCE_WEIGHT"
-echo "  • Temperature (τ): $SEMANTIC_TEMP"
-echo "  • Subsample: $SEMANTIC_SUBSAMPLE"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Training Hyperparameters
+# ─────────────────────────────────────────────────────────────────────────────
+echo "⚙️  TRAINING HYPERPARAMETERS:"
+echo "   Batch Size:        $BATCH_SIZE"
+echo "   Epochs:            $NUM_EPOCHS"
+echo "   Learning Rate:     $LEARNING_RATE"
+echo "   KL Weight:         $KL_WEIGHT"
+echo "   Recon Scale:       $RECON_SCALE"
+echo "   Eval Every:        $EVAL_EVERY epochs"
+echo "   Failure Thresh:    $FAILURE_THRESHOLD"
 echo ""
-echo "════════════════════════════════════════"
-echo "PROJECTION HEAD ARCHITECTURE"
-echo "════════════════════════════════════════"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Dataset Configuration
+# ─────────────────────────────────────────────────────────────────────────────
+echo "📊 DATASET:"
+echo "   Training Scenes:   $TRAIN_SCENES"
+echo "   Val Scenes:        $VAL_SCENES"
+echo "   Sampling:          ${SAMPLING_METHOD^^}"
+echo "   Dataset:           SceneSplat-7K (ScanNet72 labels)"
+echo "   Semantic Classes:  72 categories (38 main + 34 rare)"
 echo ""
-echo "Flow:"
-echo "  decoded_latents [B, 256, 384]"
-echo "      ↓"
-echo "  reshape [B, 98304]"
-echo "      ↓"
-echo "  8 MLP layers (GS_decoder)"
-echo "      ↓"
-echo "  hidden [B, 256] ← EXTRACT THIS!"
-echo "      |"
-echo "      ├──────────────────────┐"
-echo "      ↓                      ↓"
-echo "  output_linear      SemanticProjectionHead"
-echo "  [B, 560000]        (3-layer MLP)"
-echo "      ↓                      ↓"
-echo "  [B, 40k, 14]       [B, 40k, 128]"
-echo "  Gaussians          Semantic features"
-echo "                          ↓"
-echo "                  Contrastive Loss"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Logging
+# ─────────────────────────────────────────────────────────────────────────────
+echo "📈 LOGGING:"
+echo "   W&B:               $([ "$USE_WANDB" = "True" ] && echo "✅ Enabled" || echo "❌ Disabled")"
+echo "   Checkpoints:       Every 10 epochs"
+echo "   Best Model:        Tracked by val L2 error"
+echo "   Output Log:        logs/can3tok_${SLURM_JOB_ID}.out"
 echo ""
-echo "Projection Head Layers:"
-echo "  1. Linear(256, 1024) + BatchNorm + ReLU"
-echo "  2. Linear(1024, 2048) + BatchNorm + ReLU"
-echo "  3. Linear(2048, 5120000) → reshape [B, 40k, 128]"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Expected Performance
+# ─────────────────────────────────────────────────────────────────────────────
+echo "🎯 EXPECTED PERFORMANCE:"
+echo "   Initial L2:        ~19,000 (random)"
+echo "   Target L2:         ~3,000-5,000 (converged)"
+echo "   Failure if:        L2 > $FAILURE_THRESHOLD"
+
+if (( $(echo "$SEGMENT_WEIGHT > 0" | bc -l) )); then
+    echo ""
+    echo "   Semantic Loss:"
+    echo "      Initial:        ~4.28 (log(72), random features)"
+    echo "      Target:         ~0.5-1.5 (learned clusters)"
+    echo "      ⚠️  Watch:       Should decrease steadily"
+fi
+
 echo ""
-echo "════════════════════════════════════════"
-echo "WHY PROJECTION HEAD IS BETTER"
-echo "════════════════════════════════════════"
-echo ""
-echo "vs geo_decoder (cross-attention approach):"
-echo ""
-echo "Memory Efficiency:"
-echo "  • geo_decoder: 23 GB (needs chunking)"
-echo "  • Projection head: 2 GB (no chunking!) ✓✓"
-echo "  → 10x improvement!"
-echo ""
-echo "Computational Speed:"
-echo "  • geo_decoder: 8 chunks × cross-attention = ~15 min/epoch"
-echo "  • Projection head: Single MLP forward = ~12 min/epoch ✓✓"
-echo "  → 20% faster!"
-echo ""
-echo "Code Complexity:"
-echo "  • geo_decoder: Chunking logic, memory management"
-echo "  • Projection head: Simple MLP, single forward pass ✓✓"
-echo "  → Much simpler!"
-echo ""
-echo "Gradient Flow:"
-echo "  • geo_decoder: loss → cross_attn → query_proj → fourier"
-echo "  • Projection head: loss → MLP → hidden (direct!) ✓✓"
-echo "  → Better gradient flow!"
-echo ""
-echo "Theoretical Foundation:"
-echo "  • geo_decoder: Inspired by PointContrast (position-based)"
-echo "  • Projection head: SimCLR, MoCo (standard contrastive) ✓✓"
-echo "  → Well-established approach!"
-echo ""
-echo "Task Alignment:"
-echo "  • geo_decoder: Position-specific queries"
-echo "  • Projection head: Reconstruction hidden state ✓✓"
-echo "  → Already optimized for Gaussian prediction!"
-echo ""
-echo "════════════════════════════════════════"
-echo "LITERATURE SUPPORT"
-echo "════════════════════════════════════════"
-echo ""
-echo "Projection Head (Contrastive Learning):"
-echo "  • SimCLR (ICML 2020): Standard projection head"
-echo "  • MoCo (CVPR 2020): Momentum projection head"
-echo "  • SwAV (NeurIPS 2020): Multi-head projection"
-echo ""
-echo "Hidden State for Semantics:"
-echo "  • SAGA (2024): Uses decoder hidden for features"
-echo "  • Feature3DGS (2024): Decoder-based features"
-echo "  • SegContrast (2021): Task-aligned features"
-echo ""
-echo "Key Insight:"
-echo "  The hidden state [B, 256] is the decoder's"
-echo "  compressed understanding of the scene AFTER"
-echo "  processing through 8 MLPs. It's already"
-echo "  optimized for reconstruction, making it"
-echo "  perfect for semantic feature extraction!"
-echo ""
-echo "════════════════════════════════════════"
-echo "MEMORY ANALYSIS"
-echo "════════════════════════════════════════"
-echo ""
-echo "Base Model: ~70 GB"
-echo ""
-echo "Projection Head Forward Pass:"
-echo "  • Input: hidden [B=100, 256] = 25.6 KB"
-echo "  • Layer 1: [100, 1024] = 0.4 MB"
-echo "  • Layer 2: [100, 2048] = 0.8 MB"
-echo "  • Layer 3: [100, 5.12M] = 2.0 GB"
-echo "  • Total: ~2 GB overhead"
-echo ""
-echo "Peak Memory: 70 + 2 = 72 GB (plenty of margin!)"
-echo ""
-echo "Compare to geo_decoder:"
-echo "  • Cross-attention: [100, 40k, 1536] = 23 GB"
-echo "  • Needed chunking (8 iterations)"
-echo "  • Peak: 73 GB per chunk"
-echo ""
-echo "Projection head is 10x more efficient!"
-echo ""
-echo "════════════════════════════════════════"
-echo "EXPECTED RESULTS"
-echo "════════════════════════════════════════"
-echo ""
-echo "First Batch (Epoch 0):"
-echo "  Loss: ~32.5"
-echo "  Recon: ~2500 (scaled to ~2.5)"
-echo "  KL: ~0.01"
-echo "  Semantic: ~3.0 (weighted to ~30)"
-echo ""
-echo "After 50 Epochs:"
-echo "  Semantic: 3.0 → 1.8 ✓ (should decrease!)"
-echo "  Recon: 2500 → 2000 ✓"
-echo "  Memory: 18-20GB (stable) ✓"
-echo "  Training: ~12 min/epoch ✓ (fast!)"
-echo ""
-echo "After 200 Epochs:"
-echo "  Semantic: ~0.8-1.0 ✓ (learned semantics!)"
-echo "  Val L2: 3595 → 2700-2900 (55-65% improvement!) ✓"
-echo "  Model can cluster Gaussians by semantics ✓"
-echo ""
-echo "════════════════════════════════════════"
-echo "COMPARISON: ALL APPROACHES"
-echo "════════════════════════════════════════"
-echo ""
-echo "1. Encoder Features (Job 19139517):"
-echo "  • Semantic: Stuck at ~3.0 for 200 epochs ❌"
-echo "  • Val improvement: 51.7%"
-echo "  • Problem: Optimized for compression, not prediction"
-echo ""
-echo "2. geo_decoder (Previous attempt):"
-echo "  • Semantic: Expected ~1.0 at epoch 200 ✓"
-echo "  • Memory: 23 GB (needs chunking) ⚠️"
-echo "  • Speed: ~15 min/epoch (chunking overhead) ⚠️"
-echo "  • Val improvement: Expected 60-65%"
-echo ""
-echo "3. Projection Head (THIS JOB):"
-echo "  • Semantic: Expected ~0.8-1.0 at epoch 200 ✓✓"
-echo "  • Memory: 2 GB (no chunking!) ✓✓"
-echo "  • Speed: ~12 min/epoch (20% faster!) ✓✓"
-echo "  • Val improvement: Expected 60-65%"
-echo "  • BEST APPROACH! ✓✓✓"
-echo ""
-echo "════════════════════════════════════════"
-echo "SUCCESS INDICATORS"
-echo "════════════════════════════════════════"
-echo ""
-echo "✓ Semantic loss DECREASES (not stuck!)"
-echo "✓ Training faster than geo_decoder (~12 min vs 15 min)"
-echo "✓ Memory stable at 72 GB (no OOM)"
-echo "✓ Validation improves 60-65%"
-echo "✓ Loss scales balanced throughout"
-echo ""
-echo "IF SUCCESSFUL:"
-echo "  → This validates the projection head approach!"
-echo "  → Can proceed to longer training (500 epochs)"
-echo "  → Can add instance loss (instance_weight=0.5)"
-echo "  → Can scale to full dataset (3888 scenes)"
-echo ""
-echo "IF SEMANTIC STUCK:"
-echo "  → Check projection head implementation"
-echo "  → Verify hidden state extraction (shape [B, 256])"
-echo "  → Check gradient flow to projection head"
-echo "  → Try higher segment_weight (5.0, 10.0)"
-echo ""
-echo "════════════════════════════════════════"
+echo "════════════════════════════════════════════════════════════════════════════════"
 echo ""
 
 # ============================================================================
-# Setup Environment
+# ENVIRONMENT SETUP
 # ============================================================================
+
+echo "🔧 Setting up environment..."
 module purge && module load 2023 && module load CUDA/12.1.1
 export PATH="/home/yli11/.conda/envs/can3tok/bin:$PATH"
 export LD_LIBRARY_PATH="/home/yli11/.conda/envs/can3tok/lib/python3.11/site-packages/torch/lib:$LD_LIBRARY_PATH"
@@ -276,41 +279,62 @@ export LD_LIBRARY_PATH="/home/yli11/.conda/envs/can3tok/lib/python3.11/site-pack
 cd /home/yli11/scratch/Hafeez_thesis/Can3Tok
 mkdir -p logs checkpoints
 
+echo "   ✓ Modules loaded"
+echo "   ✓ Conda environment: can3tok"
+echo "   ✓ Working directory: $(pwd)"
+echo ""
+
 # W&B setup
 if [ "$USE_WANDB" = "True" ]; then
     wandb login $WANDB_API_KEY --relogin 2>/dev/null
-    echo "✓ W&B enabled"
-else
-    echo "✗ W&B disabled"
+    echo "   ✓ Weights & Biases authenticated"
+else:
+    echo "   ⊘ Weights & Biases disabled"
 fi
-
-echo ""
-echo "Starting training with PROJECTION HEAD approach..."
 echo ""
 
 # ============================================================================
-# Build Training Command
+# BUILD TRAINING COMMAND
 # ============================================================================
-TRAIN_CMD="python gs_can3tok_2.py"
+
+echo "🚀 Building training command..."
+
+TRAIN_CMD="python  gs_can3tok_2.py"
+
+# Training parameters
 TRAIN_CMD="$TRAIN_CMD --batch_size $BATCH_SIZE"
 TRAIN_CMD="$TRAIN_CMD --num_epochs $NUM_EPOCHS"
 TRAIN_CMD="$TRAIN_CMD --lr $LEARNING_RATE"
 TRAIN_CMD="$TRAIN_CMD --kl_weight $KL_WEIGHT"
 TRAIN_CMD="$TRAIN_CMD --eval_every $EVAL_EVERY"
 TRAIN_CMD="$TRAIN_CMD --failure_threshold $FAILURE_THRESHOLD"
+TRAIN_CMD="$TRAIN_CMD --recon_scale $RECON_SCALE"
+
+# Dataset parameters
 TRAIN_CMD="$TRAIN_CMD --train_scenes $TRAIN_SCENES"
 TRAIN_CMD="$TRAIN_CMD --val_scenes $VAL_SCENES"
 TRAIN_CMD="$TRAIN_CMD --sampling_method $SAMPLING_METHOD"
-TRAIN_CMD="$TRAIN_CMD --recon_scale $RECON_SCALE"
+
+# ============================================================================
+# SEMANTIC PARAMETERS - THESE CONTROL EVERYTHING!
+# ============================================================================
+# The training script will automatically:
+#   - Disable semantic learning if weights are 0
+#   - Enable semantic learning if weights > 0
+#   - Initialize only the selected semantic head
+# ============================================================================
+
+TRAIN_CMD="$TRAIN_CMD --semantic_mode $SEMANTIC_MODE"
 TRAIN_CMD="$TRAIN_CMD --segment_loss_weight $SEGMENT_WEIGHT"
 TRAIN_CMD="$TRAIN_CMD --instance_loss_weight $INSTANCE_WEIGHT"
 TRAIN_CMD="$TRAIN_CMD --semantic_temperature $SEMANTIC_TEMP"
 TRAIN_CMD="$TRAIN_CMD --semantic_subsample $SEMANTIC_SUBSAMPLE"
 
+# W&B parameters
 if [ "$USE_WANDB" = "True" ]; then
     TRAIN_CMD="$TRAIN_CMD --use_wandb"
-    TRAIN_CMD="$TRAIN_CMD --wandb_project $WANDB_PROJECT"
-    TRAIN_CMD="$TRAIN_CMD --wandb_entity $WANDB_ENTITY"
+    TRAIN_CMD="$TRAIN_CMD --wandb_project Can3Tok-Semantic"
+    TRAIN_CMD="$TRAIN_CMD --wandb_entity 3D-SSC"
 fi
 
 echo "Command:"
@@ -318,44 +342,47 @@ echo "$TRAIN_CMD"
 echo ""
 
 # ============================================================================
-# Run Training
+# START TRAINING
 # ============================================================================
+
+echo "════════════════════════════════════════════════════════════════════════════════"
+echo "                          STARTING TRAINING"
+echo "════════════════════════════════════════════════════════════════════════════════"
+echo ""
+
+SECONDS=0
+
 eval $TRAIN_CMD
 TRAIN_EXIT=$?
 
-# ============================================================================
-# Report Results
-# ============================================================================
 DURATION=$((SECONDS / 60))
 
 echo ""
-echo "=========================================="
+echo "════════════════════════════════════════════════════════════════════════════════"
+echo "                          TRAINING COMPLETE"
+echo "════════════════════════════════════════════════════════════════════════════════"
+echo "Exit code:     $TRAIN_EXIT"
+echo "Duration:      $DURATION minutes"
+echo "End time:      $(date)"
+echo ""
+
 if [ $TRAIN_EXIT -eq 0 ]; then
-    echo "✅ TRAINING COMPLETED!"
-    echo "=========================================="
-    echo "Duration: ${DURATION} minutes"
+    echo "✅ Training completed successfully!"
     echo ""
-    echo "════════════════════════════════════════"
-    echo "CHECK THESE IN YOUR LOGS:"
-    echo "════════════════════════════════════════"
-    echo "════════════════════════════════════════"
-    echo "NEXT STEPS"
-    echo "════════════════════════════════════════"
-    echo ""
+    echo "Next steps:"
+    echo "   1. Check logs:           cat logs/can3tok_${SLURM_JOB_ID}.out"
+    echo "   2. Find checkpoints:     ls checkpoints/job_${SLURM_JOB_ID}_*/"
+    echo "   3. Load best model:      checkpoints/job_${SLURM_JOB_ID}_*/best_model.pth"
+    if [ "$USE_WANDB" = "True" ]; then
+        echo "   4. View W&B dashboard:   https://wandb.ai/3D-SSC/Can3Tok-Semantic"
+    fi
 else
-    echo "❌ TRAINING FAILED"
-    echo "=========================================="
-    echo "Exit code: $TRAIN_EXIT"
+    echo "❌ Training failed with exit code $TRAIN_EXIT"
     echo ""
-    echo "Check:"
-    echo "  1. Error log: logs/can3tok_projhead_${SLURM_JOB_ID}.err"
-    echo "  2. Output log: logs/can3tok_projhead_${SLURM_JOB_ID}.out"
-    echo "  3. sal_perceiver.py updated with projection head"
-    echo "  4. SemanticProjectionHead class exists"
-    echo "  5. GS_decoder returns hidden state"
-    echo ""
-    echo ""
+    echo "Troubleshooting:"
+    echo "   1. Check error log:      cat logs/can3tok_${SLURM_JOB_ID}.err"
+    echo "   2. Check GPU memory:     nvidia-smi"
+    echo "   3. Verify dataset path:  ls /home/yli11/scratch/datasets/gaussian_world/preprocessed/interior_gs/"
 fi
 
-echo "End time: $(date)"
-echo "=========================================="
+echo "════════════════════════════════════════════════════════════════════════════════"
