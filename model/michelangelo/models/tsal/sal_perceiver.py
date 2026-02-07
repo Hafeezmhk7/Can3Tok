@@ -1,4 +1,21 @@
 # -*- coding: utf-8 -*-
+"""
+sal_perceiver.py - THREE Approaches for Per-Gaussian Semantic Features
+
+APPROACH 1: Hidden State → MLP Projection
+  - Input: Decoder hidden state [B, 1024]
+  - Expands to per-Gaussian features via 3-layer MLP
+  
+APPROACH 2: Geometric Gaussians → MLP Projection  
+  - Input: Reconstructed geometric Gaussians [B, 40k, 11]
+  - Standard SimCLR-style projection head
+  
+APPROACH 3: Cross-Attention Semantic Head
+  - Input: Transformer tokens [B, 512, 384] + Gaussian positions [B, 40k, 3]
+  - Gaussians attend to scene tokens via cross-attention
+
+Switch via semantic_mode: 'hidden', 'geometric', or 'attention'
+"""
 
 import torch
 import torch.nn as nn
@@ -7,11 +24,10 @@ from einops import repeat
 import math
 import numpy as np
 
-from Michelangelo.michelangelo.models.modules import checkpoint
-from Michelangelo.michelangelo.models.modules.embedder import FourierEmbedder
-
-from Michelangelo.michelangelo.models.modules.distributions import DiagonalGaussianDistribution
-from Michelangelo.michelangelo.models.modules.transformer_blocks import (
+from model.michelangelo.models.modules import checkpoint
+from model.michelangelo.models.modules.embedder import FourierEmbedder
+from model.michelangelo.models.modules.distributions import DiagonalGaussianDistribution
+from model.michelangelo.models.modules.transformer_blocks import (
     ResidualCrossAttentionBlock,
     Transformer
 )
@@ -19,8 +35,96 @@ from Michelangelo.michelangelo.models.modules.transformer_blocks import (
 from .tsal_base import ShapeAsLatentModule
 
 
-class CrossAttentionEncoder(nn.Module):
+# ============================================================================
+# APPROACH 1: HIDDEN STATE → MLP PROJECTION
+# ============================================================================
+class SemanticProjectionHead(nn.Module):
+    """
+    Projects decoder hidden state to per-Gaussian semantic features.
+    
+    Input: Decoder hidden state [B, 1024]
+    Output: [B, 40k, 32] L2-normalized semantic features
+    """
+    def __init__(self, hidden_dim=1024, num_gaussians=40000, feature_dim=32):
+        super().__init__()
+        self.hidden_dim = hidden_dim
+        self.num_gaussians = num_gaussians
+        self.feature_dim = feature_dim
+        
+        # 3-layer MLP expanding hidden state
+        self.projection = nn.Sequential(
+            # Layer 1: Compress
+            nn.Linear(hidden_dim, 512),
+            nn.LayerNorm(512),
+            nn.ReLU(),
+            # Layer 2: Further compress
+            nn.Linear(512, 256),
+            nn.LayerNorm(256),
+            nn.ReLU(),
+            # Layer 3: Expand to all Gaussians
+            nn.Linear(256, num_gaussians * feature_dim),
+        )
+        
+        total_params = sum(p.numel() for p in self.parameters())
+        print(f"[SemanticProjectionHead] Hidden State → MLP:")
+        print(f"  Input: [B, {hidden_dim}] (decoder hidden state)")
+        print(f"  Output: [B, {num_gaussians}, {feature_dim}]")
+        print(f"  Parameters: {total_params / 1e6:.3f}M")
+    
+    def forward(self, hidden):
+        B = hidden.shape[0]
+        expanded = self.projection(hidden)
+        features = expanded.reshape(B, self.num_gaussians, self.feature_dim)
+        features = torch.nn.functional.normalize(features, p=2, dim=-1)
+        return features
 
+
+# ============================================================================
+# APPROACH 2: GEOMETRIC GAUSSIANS → MLP PROJECTION
+# ============================================================================
+class SemanticProjectionHeadGeometric(nn.Module):
+    """
+    Standard 3-layer MLP projection head (like SimCLR).
+    
+    Input: Geometric Gaussian parameters [B, 40k, 11]
+    Output: [B, 40k, 32] L2-normalized semantic features
+    """
+    def __init__(self, gaussian_dim=11, num_gaussians=40000, feature_dim=32, hidden_dim=128):
+        super().__init__()
+        self.gaussian_dim = gaussian_dim
+        self.num_gaussians = num_gaussians
+        self.feature_dim = feature_dim
+        self.hidden_dim = hidden_dim
+        
+        self.projection = nn.Sequential(
+            nn.Linear(gaussian_dim, hidden_dim),
+            nn.BatchNorm1d(hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.BatchNorm1d(hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, feature_dim),
+        )
+        
+        total_params = sum(p.numel() for p in self.parameters())
+        print(f"[SemanticProjectionHeadGeometric] Geometric → MLP:")
+        print(f"  Input: [B, {num_gaussians}, {gaussian_dim}]")
+        print(f"  Output: [B, {num_gaussians}, {feature_dim}]")
+        print(f"  Parameters: {total_params / 1e6:.3f}M")
+    
+    def forward(self, gaussians):
+        B, N, D = gaussians.shape
+        gaussians_flat = gaussians.reshape(B * N, D)
+        features_flat = self.projection(gaussians_flat)
+        features = features_flat.reshape(B, N, self.feature_dim)
+        features = torch.nn.functional.normalize(features, p=2, dim=-1)
+        return features
+
+
+# ============================================================================
+# ENCODER
+# ============================================================================
+class CrossAttentionEncoder(nn.Module):
     def __init__(self, *,
                  device: Optional[torch.device],
                  dtype: Optional[torch.dtype],
@@ -38,42 +142,32 @@ class CrossAttentionEncoder(nn.Module):
                  use_checkpoint: bool = False):
 
         super().__init__()
-
         self.use_checkpoint = use_checkpoint
         self.num_latents = num_latents
 
-        # self.query = nn.Parameter(torch.randn((num_latents, width), device=device, dtype=dtype) * 0.02)
-
-        ######
         voxel_reso = 4
-        x_y = np.linspace(-8, 8, voxel_reso)   # 50
-        z_res = np.linspace(-8, 8, voxel_reso) # 16
+        x_y = np.linspace(-8, 8, voxel_reso)
         xv, yv, zv = np.meshgrid(x_y, x_y, x_y, indexing='ij')
-        voxel_centers = torch.tensor(np.vstack([xv.ravel(), yv.ravel(), zv.ravel()]).T, device=device, dtype=dtype).reshape([-1,3])
-        # dummy_tensor = torch.randn((voxel_centers.shape[0]+1, width), device=device, dtype=dtype)
-        # dummy_tensor[:,:192] = voxel_centers.reshape([-1])
+        voxel_centers = torch.tensor(
+            np.vstack([xv.ravel(), yv.ravel(), zv.ravel()]).T,
+            device=device,
+            dtype=dtype
+        ).reshape([-1, 3])
 
-        dummy_tensor2 = torch.randn((num_latents, width), device=device, dtype=dtype)*0.02
-        dummy_tensor2[:,:192] = voxel_centers.reshape([-1])*0.01                            
+        dummy_tensor2 = torch.randn((num_latents, width), device=device, dtype=dtype) * 0.02
+        dummy_tensor2[:, :192] = voxel_centers.reshape([-1]) * 0.01
         self.query = nn.Parameter(dummy_tensor2)
-        
-        ######
-
-
         
         self.point_feats = point_feats
         self.fourier_embedder = fourier_embedder
         self.fourier_embedder_ID = fourier_embedder_ID
 
-        #### PE_gama_xyz
-        # self.input_proj = nn.Linear(self.fourier_embedder.out_dim+point_feats+self.fourier_embedder_ID.out_dim,width,device=device,dtype=dtype)
-        
-        ### no PE
-        self.input_proj = nn.Linear(self.fourier_embedder.out_dim+point_feats,width,device=device,dtype=dtype)
-
-        ### PE_xyz
-        # self.input_proj = nn.Linear(self.fourier_embedder.out_dim+point_feats+3,width,device=device,dtype=dtype)
-
+        self.input_proj = nn.Linear(
+            self.fourier_embedder.out_dim + point_feats,
+            width,
+            device=device,
+            dtype=dtype
+        )
 
         self.cross_attn = ResidualCrossAttentionBlock(
             device=device,
@@ -104,37 +198,15 @@ class CrossAttentionEncoder(nn.Module):
             self.ln_post = None
 
     def _forward(self, pc, feats):
-        """
-
-        Args:
-            pc (torch.FloatTensor): [B, N, 18]    0:3 -> voxel centers, 3 -> voxel ID, 4:7-> xyz, 7:18-> features
-            feats (torch.FloatTensor or None): [B, N, 18]    0:3 -> voxel centers, 3 -> voxel ID, 4:7-> xyz, 7:18-> features
-
-        Returns:
-
-        """
         bs = pc.shape[0]
-        voxel_ID = pc[:,:,3]
-        voxel_coords = pc[:,:,:3]
-        feats = feats[:,:,7:]
-
-        ### voxel_coords embedding
-        voxel_coords_emb = self.fourier_embedder_ID(voxel_coords) 
-
-        ### voxel_ID embedding
-        # voxel_ID_emb = self.fourier_embedder_ID(voxel_ID.unsqueeze(-1)) 
-        
-        data = self.fourier_embedder(pc[:,:,4:7])
+        feats = feats[:, :, 7:]
+        data = self.fourier_embedder(pc[:, :, 4:7])
        
         if feats is not None:
-            # data = torch.cat([data, voxel_coords_emb, feats], dim=-1) # voxel_coords embedding   gamma(xyz)
-            
-            # data = torch.cat([data, voxel_ID_emb, feats], dim=-1) # voxel_ID embedding
-    
-            data = torch.cat([data, feats], dim=-1).to(dtype=torch.float32)  # 10_xyz_pe no pe
-        data = self.input_proj(data) # data: [100, 16384, 1->51] [100, 16384, 11]
-        query = repeat(self.query, "m c -> b m c", b=bs) # learnable queries
-
+            data = torch.cat([data, feats], dim=-1).to(dtype=torch.float32)
+        
+        data = self.input_proj(data)
+        query = repeat(self.query, "m c -> b m c", b=bs)
         latents = self.cross_attn(query, data)
         latents = self.self_attn(latents)
 
@@ -144,21 +216,13 @@ class CrossAttentionEncoder(nn.Module):
         return latents, pc
 
     def forward(self, pc: torch.FloatTensor, feats: Optional[torch.FloatTensor] = None):
-        """
-
-        Args:
-            pc (torch.FloatTensor): [B, N, 3]
-            feats (torch.FloatTensor or None): [B, N, C]
-
-        Returns:
-            dict
-        """
-
         return checkpoint(self._forward, (pc, feats), self.parameters(), self.use_checkpoint)
 
 
+# ============================================================================
+# DECODER (MUST BE DEFINED BEFORE GaussianSemanticAttentionHead!)
+# ============================================================================
 class CrossAttentionDecoder(nn.Module):
-
     def __init__(self, *,
                  device: Optional[torch.device],
                  dtype: Optional[torch.dtype],
@@ -173,11 +237,15 @@ class CrossAttentionDecoder(nn.Module):
                  use_checkpoint: bool = False):
 
         super().__init__()
-
         self.use_checkpoint = use_checkpoint
         self.fourier_embedder = fourier_embedder
 
-        self.query_proj = nn.Linear(self.fourier_embedder.out_dim, width, device=device, dtype=dtype)
+        self.query_proj = nn.Linear(
+            self.fourier_embedder.out_dim,
+            width,
+            device=device,
+            dtype=dtype
+        )
 
         self.cross_attn_decoder = ResidualCrossAttentionBlock(
             device=device,
@@ -203,7 +271,84 @@ class CrossAttentionDecoder(nn.Module):
     def forward(self, queries: torch.FloatTensor, latents: torch.FloatTensor):
         return checkpoint(self._forward, (queries, latents), self.parameters(), self.use_checkpoint)
 
+
+# ============================================================================
+# APPROACH 3: CROSS-ATTENTION SEMANTIC HEAD (NOW DEFINED AFTER CrossAttentionDecoder!)
+# ============================================================================
+class GaussianSemanticAttentionHead(CrossAttentionDecoder):
+    """
+    Cross-attention semantic head (inherits from CrossAttentionDecoder).
+    
+    Input:
+        - Gaussian positions [B, 40k, 3] (as queries)
+        - Transformer tokens [B, 512, 384] (as keys/values)
+    
+    Output: [B, 40k, 32] semantic features
+    """
+    
+    def __init__(self, *,
+                 device: Optional[torch.device],
+                 dtype: Optional[torch.dtype],
+                 num_latents: int,
+                 out_channels: int,
+                 fourier_embedder: FourierEmbedder,
+                 width: int,
+                 heads: int,
+                 init_scale: float = 0.25,
+                 qkv_bias: bool = True,
+                 flash: bool = False,
+                 use_checkpoint: bool = False):
+        
+        # Initialize parent CrossAttentionDecoder
+        super().__init__(
+            device=device,
+            dtype=dtype,
+            num_latents=num_latents,
+            out_channels=out_channels,
+            fourier_embedder=fourier_embedder,
+            width=width,
+            heads=heads,
+            init_scale=init_scale,
+            qkv_bias=qkv_bias,
+            flash=flash,
+            use_checkpoint=use_checkpoint
+        )
+        
+        total_params = sum(p.numel() for p in self.parameters())
+        print(f"[GaussianSemanticAttentionHead] Cross-Attention:")
+        print(f"  Queries: [B, 40k, 3] Gaussian positions")
+        print(f"  Keys/Values: [B, {num_latents}, {width}] scene tokens")
+        print(f"  Output: [B, 40k, {out_channels}]")
+        print(f"  Parameters: {total_params / 1e6:.3f}M")
+    
+    def forward(self, gaussian_xyz, scene_tokens):
+        """
+        Args:
+            gaussian_xyz: [B, 40000, 3] - Gaussian positions
+            scene_tokens: [B, 512, 384] - Transformer output tokens
+        
+        Returns:
+            semantic_features: [B, 40000, feature_dim]
+        """
+        # Use parent class's forward
+        features = super().forward(gaussian_xyz, scene_tokens)
+        
+        # L2 normalize
+        features = torch.nn.functional.normalize(features, p=2, dim=-1)
+        
+        return features
+
+
+# ============================================================================
+# GS_DECODER (WITH HIDDEN STATE EXTRACTION)
+# ============================================================================
 class GS_decoder(nn.Module):
+    """
+    MLP decoder for Gaussian parameters.
+    Returns hidden state for semantic projection.
+    
+    Output: 11 geometric params (xyz, opacity, scale, quat) - NO RGB!
+    """
     def __init__(self, D=8, W=256, input_ch=4, skip=[4], output_ch=56):
         super(GS_decoder, self).__init__()
         self.D = D
@@ -211,51 +356,31 @@ class GS_decoder(nn.Module):
         self.input_ch = input_ch
         self.skips = skip
         self.output_ch = output_ch
-        self.pts_linears = nn.ModuleList([nn.Linear(input_ch,W)])
+        
+        self.pts_linears = nn.ModuleList([nn.Linear(input_ch, W)])
         for i in range(D-1):
             self.pts_linears.append(nn.Linear(W, W))
-            # self.pts_linears.append(nn.BatchNorm1d(W))
             self.pts_linears.append(nn.LayerNorm(W))
-            # self.pts_linears.append(nn.InstanceNorm1d(W))
             self.pts_linears.append(nn.ReLU())
         
         self.output_linear = nn.Linear(in_features=W, out_features=output_ch)
-        # self.bn_layer_output = nn.BatchNorm1d(output_ch)
         
-    def forward(self, x):
+    def forward(self, x, return_hidden=False):
         for i, l in enumerate(self.pts_linears):
             x = self.pts_linears[i](x)
-            # x = F.relu(x)
-            # x = self.act(x)
-        # x = self.bn_layer_output(self.output_linear(x))
-  
-        x = self.output_linear(x)
-        return x
-
-# class GS_decoder(nn.Module):
-#     def __init__(self, D=8, W=256, input_ch=4, skip=[4], output_ch=56):
-#         super(GS_decoder, self).__init__()
-#         self.D = D
-#         self.W = W
-#         self.input_ch = input_ch
-#         self.skips = skip
-#         self.output_ch = output_ch
-
-#         # self.conv = nn.Conv3d(1, 14, 6, stride=1, padding=0)
-#         # self.output_linear_0 = nn.Linear(in_features=64000, out_features=40000)
-#         self.output_linear_1 = nn.Linear(in_features=14, out_features=14)
         
-#         # self.bn_layer_output = nn.BatchNorm1d(output_ch)
+        hidden = x
+        output = self.output_linear(x)
         
-#     def forward(self, x):
-#         # x = self.conv(x.reshape([x.shape[0],1,40,40,40])).reshape([x.shape[0],14,-1]).transpose(2,1)
-#         # x = self.output_linear_1(x)
-#         x=x
-
-       
-#         return x
+        if return_hidden:
+            return output, hidden
+        else:
+            return output
 
 
+# ============================================================================
+# SHAPE AS LATENT PERCEIVER (base class)
+# ============================================================================
 class ShapeAsLatentPerceiver(ShapeAsLatentModule):
     def __init__(self, *,
                  device: Optional[torch.device],
@@ -276,18 +401,23 @@ class ShapeAsLatentPerceiver(ShapeAsLatentModule):
                  use_checkpoint: bool = False):
 
         super().__init__()
-        # ##### learnable output query
-        # self.learnable_output_queries = nn.Parameter(torch.randn(125,40000))
         
         self.use_checkpoint = use_checkpoint
-
         self.num_latents = num_latents
-        self.fourier_embedder = FourierEmbedder(num_freqs=num_freqs, include_pi=include_pi, input_dim=3)
         
-        self.fourier_embedder_ID = FourierEmbedder(num_freqs=num_freqs, include_pi=include_pi, input_dim=3)
-        # self.fourier_embedder_ID = FourierEmbedder(num_freqs=6, include_pi=include_pi, input_dim=1)
+        self.fourier_embedder = FourierEmbedder(
+            num_freqs=num_freqs,
+            include_pi=include_pi,
+            input_dim=3
+        )
+        self.fourier_embedder_ID = FourierEmbedder(
+            num_freqs=num_freqs,
+            include_pi=include_pi,
+            input_dim=3
+        )
 
         init_scale = init_scale * math.sqrt(1.0 / width)
+        
         self.encoder = CrossAttentionEncoder(
             device=device,
             dtype=dtype,
@@ -307,7 +437,6 @@ class ShapeAsLatentPerceiver(ShapeAsLatentModule):
 
         self.embed_dim = embed_dim
         if embed_dim > 0:
-            # VAE embed
             self.pre_kl = nn.Linear(width, embed_dim * 2, device=device, dtype=dtype)
             self.post_kl = nn.Linear(embed_dim, width, device=device, dtype=dtype)
             self.latent_shape = (num_latents, embed_dim)
@@ -326,16 +455,13 @@ class ShapeAsLatentPerceiver(ShapeAsLatentModule):
             flash=flash,
             use_checkpoint=use_checkpoint
         )
-        # original: (3,1024,width*256,[4],14*16384)  now (3,1024,width*256,[4],14*40000)
-        # self.GS_decoder = GS_decoder(3,1024,width*512,[4],16384*14)  # original
         
-        self.GS_decoder = GS_decoder(3,1024,width*512,[4],40000*14)    # filtered
-
+        # Output: 11 params (xyz, opacity, scale, quat) - NO RGB!
+        self.GS_decoder = GS_decoder(3, 1024, width*512, [4], 40000*11)
         
-        self.kl_emb_proj_mean = nn.Linear((num_latents-1)*embed_dim, 64*64*4, dtype=dtype) 
+        self.kl_emb_proj_mean = nn.Linear((num_latents-1)*embed_dim, 64*64*4, dtype=dtype)
         self.kl_emb_proj_var = nn.Linear((num_latents-1)*embed_dim, 64*64*4, dtype=dtype)
         
-        # geometry decoder
         self.geo_decoder = CrossAttentionDecoder(
             device=device,
             dtype=dtype,
@@ -354,19 +480,6 @@ class ShapeAsLatentPerceiver(ShapeAsLatentModule):
                pc: torch.FloatTensor,
                feats: Optional[torch.FloatTensor] = None,
                sample_posterior: bool = True):
-        """
-
-        Args:
-            pc (torch.FloatTensor): [B, N, 3]
-            feats (torch.FloatTensor or None): [B, N, C]
-            sample_posterior (bool):
-
-        Returns:
-            latents (torch.FloatTensor)
-            center_pos (torch.FloatTensor or None):
-            posterior (DiagonalGaussianDistribution or None):
-        """
-     
         latents, center_pos = self.encoder(pc, feats)
 
         posterior = None
@@ -381,18 +494,10 @@ class ShapeAsLatentPerceiver(ShapeAsLatentModule):
 
         return latents, center_pos, posterior
 
-
-    
     def decode(self, latents: torch.FloatTensor, volume_queries=None):
         latents = self.post_kl(latents)
         latents = self.transformer(latents)
-        #########
-        # learn_volume_queries = (volume_queries.transpose(2,1)@self.learnable_output_queries).transpose(2,1)
-        # logits = self.query_geometry(volume_queries, latents)
-        # return self.GS_decoder(logits.reshape([logits.shape[0], volume_queries.shape[1],14]))
-        #########
-    
-        return self.GS_decoder(latents.reshape(latents.shape[0],-1))
+        return self.GS_decoder(latents.reshape(latents.shape[0], -1))
 
     def query_geometry(self, queries: torch.FloatTensor, latents: torch.FloatTensor):
         logits = self.geo_decoder(queries, latents).squeeze(-1)
@@ -403,31 +508,16 @@ class ShapeAsLatentPerceiver(ShapeAsLatentModule):
                 feats: torch.FloatTensor,
                 volume_queries: torch.FloatTensor,
                 sample_posterior: bool = True):
-        """
-
-        Args:
-            pc (torch.FloatTensor): [B, N, 3]
-            feats (torch.FloatTensor or None): [B, N, C]
-            volume_queries (torch.FloatTensor): [B, P, 3]
-            sample_posterior (bool):
-
-        Returns:
-            logits (torch.FloatTensor): [B, P]
-            center_pos (torch.FloatTensor): [B, M, 3]
-            posterior (DiagonalGaussianDistribution or None).
-
-        """
-
         latents, center_pos, posterior = self.encode(pc, feats, sample_posterior=sample_posterior)
-
-        latents = self.decode(latents)
+        latents_decoded = self.decode(latents)
         logits = self.query_geometry(volume_queries, latents)
-        
         return logits, center_pos, posterior
 
 
+# ============================================================================
+# ALIGNED SHAPE LATENT PERCEIVER (WITH ALL THREE SEMANTIC HEADS)
+# ============================================================================
 class AlignedShapeLatentPerceiver(ShapeAsLatentPerceiver):
-
     def __init__(self, *,
                  device: Optional[torch.device],
                  dtype: Optional[torch.dtype],
@@ -442,9 +532,11 @@ class AlignedShapeLatentPerceiver(ShapeAsLatentPerceiver):
                  num_decoder_layers: int,
                  init_scale: float = 0.25,
                  qkv_bias: bool = True,
-                 flash: bool = True,  ###### change here
+                 flash: bool = True,
                  use_ln_post: bool = False,
-                 use_checkpoint: bool = False):
+                 use_checkpoint: bool = False,
+                 semantic_mode: str = 'hidden'  # 'hidden', 'geometric', or 'attention'
+                 ):
 
         super().__init__(
             device=device,
@@ -466,41 +558,99 @@ class AlignedShapeLatentPerceiver(ShapeAsLatentPerceiver):
         )
 
         self.width = width
+        self.semantic_mode = semantic_mode
+        
+        print(f"\n{'='*70}")
+        print(f"[AlignedShapeLatentPerceiver] semantic_mode='{semantic_mode}'")
+        print(f"{'='*70}")
+        
+        # Initialize ALL THREE semantic heads
+        self.semantic_projection_hidden = SemanticProjectionHead(
+            hidden_dim=1024,
+            num_gaussians=40000,
+            feature_dim=32
+        )
+        
+        self.semantic_projection_geometric = SemanticProjectionHeadGeometric(
+            gaussian_dim=11,
+            num_gaussians=40000,
+            feature_dim=32,
+            hidden_dim=128
+        )
+        
+        self.semantic_attention_head = GaussianSemanticAttentionHead(
+            device=device,
+            dtype=dtype,
+            num_latents=num_latents,
+            out_channels=32,
+            fourier_embedder=self.fourier_embedder,
+            width=width,
+            heads=heads,
+            init_scale=init_scale,
+            qkv_bias=qkv_bias,
+            flash=flash,
+            use_checkpoint=use_checkpoint
+        )
+        
+        print(f"\n{'='*70}")
+        print(f"✓ ALL THREE SEMANTIC HEADS INITIALIZED")
+        print(f"  Active mode: '{semantic_mode}'")
+        print(f"{'='*70}\n")
 
     def encode(self,
                pc: torch.FloatTensor,
                feats: Optional[torch.FloatTensor] = None,
                sample_posterior: bool = True):
-        """
-
-        Args:
-            pc (torch.FloatTensor): [B, N, 3]
-            feats (torch.FloatTensor or None): [B, N, c]
-            sample_posterior (bool):
-
-        Returns:
-            shape_embed (torch.FloatTensor)
-            kl_embed (torch.FloatTensor):
-            posterior (DiagonalGaussianDistribution or None):
-        """
         shape_embed, latents = self.encode_latents(pc, feats)
         kl_embed, posterior = self.encode_kl_embed(latents, sample_posterior)
-        kl_embed = kl_embed.reshape([kl_embed.shape[0],-1])
-        mu, log_var = self.kl_emb_proj_mean(kl_embed), self.kl_emb_proj_var(kl_embed)
+        
+        kl_embed = kl_embed.reshape([kl_embed.shape[0], -1])
+        mu = self.kl_emb_proj_mean(kl_embed)
+        log_var = self.kl_emb_proj_var(kl_embed)
+        
         std = torch.exp(0.5 * log_var).to(log_var.device)
         eps = torch.randn_like(std).to(std.device)
-        z = mu + std * eps.to(std.device) 
+        z = mu + std * eps.to(std.device)
+        
         return shape_embed, mu, log_var, z, posterior
-        # return shape_embed, posterior.mean.reshape([kl_embed.shape[0],-1]), posterior.logvar.reshape([kl_embed.shape[0],-1]), kl_embed.reshape([kl_embed.shape[0],-1]), posterior
+
+    def decode(self, latents: torch.FloatTensor, volume_queries=None, return_semantic_features=False):
+        """
+        Decode with THREE MODES for semantic features.
+        """
+        latents = self.post_kl(latents)
+        latents_transformed = self.transformer(latents)  # [B, 512, 384]
+        latents_flat = latents_transformed.reshape(latents_transformed.shape[0], -1)
+        
+        if return_semantic_features and self.training:
+            reconstruction, hidden = self.GS_decoder(latents_flat, return_hidden=True)
+            B = reconstruction.shape[0]
+            reconstruction_gaussians = reconstruction.reshape(B, 40000, 11)
+            
+            if self.semantic_mode == 'hidden':
+                semantic_features = self.semantic_projection_hidden(hidden)
+            elif self.semantic_mode == 'geometric':
+                semantic_features = self.semantic_projection_geometric(reconstruction_gaussians)
+            elif self.semantic_mode == 'attention':
+                gaussian_positions = reconstruction_gaussians[:, :, 0:3]
+                semantic_features = self.semantic_attention_head(
+                    gaussian_positions, 
+                    latents_transformed
+                )
+            else:
+                raise ValueError(f"Unknown semantic_mode: {self.semantic_mode}")
+            
+            return reconstruction, semantic_features
+        else:
+            reconstruction = self.GS_decoder(latents_flat, return_hidden=False)
+            return reconstruction
 
     def encode_latents(self,
                        pc: torch.FloatTensor,
                        feats: Optional[torch.FloatTensor] = None):
-
-        x, _ = self.encoder(pc, feats)   # [B, 257, 384] [B, num_latents, width]
+        x, _ = self.encoder(pc, feats)
         shape_embed = x[:, 0]
         latents = x[:, 1:]
-
         return shape_embed, latents
 
     def encode_kl_embed(self, latents: torch.FloatTensor, sample_posterior: bool = True):
@@ -523,23 +673,24 @@ class AlignedShapeLatentPerceiver(ShapeAsLatentPerceiver):
                 feats: torch.FloatTensor,
                 volume_queries: torch.FloatTensor,
                 sample_posterior: bool = True):
-        """
+        shape_embed, mu, log_var, z, posterior = self.encode(
+            pc, feats, sample_posterior=sample_posterior
+        )
 
-        Args:
-            pc (torch.FloatTensor): [B, N, 3]
-            feats (torch.FloatTensor or None): [B, N, C]
-            volume_queries (torch.FloatTensor): [B, P, 3]
-            sample_posterior (bool):
-
-        Returns:
-            shape_embed (torch.FloatTensor): [B, projection_dim]
-            logits (torch.FloatTensor): [B, M]
-            posterior (DiagonalGaussianDistribution or None).
-
-        """
-        shape_embed, kl_embed, posterior = self.encode(pc, feats, sample_posterior=sample_posterior)
-
-        latents = self.decode(kl_embed)
-        logits = self.query_geometry(volume_queries, latents)
-
-        return shape_embed, logits, posterior
+        latents_reshaped = z.reshape(z.shape[0], 512, 32)
+        
+        if self.training:
+            UV_gs_recover, per_gaussian_features = self.decode(
+                latents_reshaped,
+                volume_queries,
+                return_semantic_features=True
+            )
+        else:
+            UV_gs_recover = self.decode(
+                latents_reshaped,
+                volume_queries,
+                return_semantic_features=False
+            )
+            per_gaussian_features = None
+        
+        return shape_embed, mu, log_var, z, UV_gs_recover, per_gaussian_features
