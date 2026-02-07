@@ -10,7 +10,7 @@ import pytorch_lightning as pl
 from typing import Union
 from functools import partial
 
-from Michelangelo.michelangelo.utils import instantiate_from_config
+from model.michelangelo.utils import instantiate_from_config
 
 from .inference_utils import extract_geometry
 from .tsal_base import (
@@ -36,12 +36,8 @@ class AlignedShapeAsLatentPLModule(pl.LightningModule):
         self.shape_model: ShapeAsLatentModule = instantiate_from_config(
             shape_module_cfg, device=None, dtype=None
         )
-        # self.model: AlignedShapeAsLatentModule = instantiate_from_config(
-        #     aligned_module_cfg, shape_model=shape_model
-        # )
 
         self.loss = instantiate_from_config(loss_cfg)
-
         self.optimizer_cfg = optimizer_cfg
 
         if ckpt_path is not None:
@@ -62,7 +58,6 @@ class AlignedShapeAsLatentPLModule(pl.LightningModule):
             zero_rank = self.trainer.local_rank == 0
         else:
             zero_rank = True
-
         return zero_rank
 
     def init_from_ckpt(self, path, ignore_keys=()):
@@ -111,36 +106,29 @@ class AlignedShapeAsLatentPLModule(pl.LightningModule):
                 image: torch.FloatTensor,
                 text: torch.FloatTensor,
                 volume_queries: torch.FloatTensor):
-
         """
-
-        Args:
-            surface (torch.FloatTensor):
-            image (torch.FloatTensor):
-            text (torch.FloatTensor):
-            volume_queries (torch.FloatTensor):
-
+        Forward pass through the model.
+        
         Returns:
-
+            shape_embed: [B, width] - Shape embedding
+            mu: [B, 16384] - VAE mean
+            log_var: [B, 16384] - VAE log variance
+            z: [B, 16384] - Sampled latent
+            UV_gs_recover: [B, 560000] - Reconstructed Gaussians
+            per_gaussian_features: [B, 40000, 32] or None - Semantic features
         """
-
-        # embed_outputs, shape_z = self.model(surface, image, text)
-        # shape_zq, posterior = self.model.shape_model.encode_kl_embed(shape_z)
-        # latents = self.model.shape_model.decode(shape_zq)
-        # logits = self.model.shape_model.query_geometry(volume_queries, latents)
-        
-        # return embed_outputs, logits, posterior
-        pc = surface[..., :4]
-        feats = surface[..., 4:]
-        
-        shape_embed, mu, log_var, shape_zq, posterior = self.shape_model.encode(
-            pc=surface, feats=surface, sample_posterior=True
+        # Call the actual model's forward method
+        shape_embed, mu, log_var, z, UV_gs_recover, per_gaussian_features = self.shape_model(
+            pc=surface,
+            feats=surface,
+            volume_queries=volume_queries,
+            sample_posterior=True
         )
-        UV_gs_recover = self.shape_model.decode(shape_zq.reshape([shape_zq.shape[0], 512, 32]), volume_queries)# [shape_zq.shape[0], 256, 64]   
-        return shape_embed, mu, log_var, shape_zq, UV_gs_recover
+        
+        # Return all 6 values
+        return shape_embed, mu, log_var, z, UV_gs_recover, per_gaussian_features
 
     def encode(self, surface: torch.FloatTensor, sample_posterior=True):
-
         pc = surface[..., 0:3]
         feats = surface[..., 3:]
 
@@ -156,30 +144,11 @@ class AlignedShapeAsLatentPLModule(pl.LightningModule):
                octree_depth: int = 7,
                num_chunks: int = 10000) -> List[Latent2MeshOutput]:
 
-        latents = self.shape_model.decode(z_q)  # latents: [bs, num_latents, dim]
-        # outputs = self.latent2mesh(latents, bounds=bounds, octree_depth=octree_depth, num_chunks=num_chunks)
-
+        latents = self.shape_model.decode(z_q, return_semantic_features=False)
         return latents
-
+        
     def training_step(self, batch: Dict[str, torch.FloatTensor],
                       batch_idx: int, optimizer_idx: int = 0) -> torch.FloatTensor:
-        """
-
-        Args:
-            batch (dict): the batch sample, and it contains:
-                - surface (torch.FloatTensor): [bs, n_surface, (3 + input_dim)]
-                - image (torch.FloatTensor): [bs, 3, 224, 224]
-                - text (torch.FloatTensor): [bs, num_templates, 77]
-                - geo_points (torch.FloatTensor): [bs, n_pts, (3 + 1)]
-
-            batch_idx (int):
-
-            optimizer_idx (int):
-
-        Returns:
-            loss (torch.FloatTensor):
-
-        """
 
         surface = batch["surface"]
         image = batch["image"]
@@ -234,22 +203,6 @@ class AlignedShapeAsLatentPLModule(pl.LightningModule):
                          bounds: Union[Tuple[float], List[float]] = (-1.25, -1.25, -1.25, 1.25, 1.25, 1.25),
                          octree_depth: int = 7,
                          num_chunks: int = 10000) -> List[AlignedMeshOutput]:
-
-        """
-
-        Args:
-            surface:
-            image:
-            text:
-            description:
-            bounds:
-            octree_depth:
-            num_chunks:
-
-        Returns:
-            mesh_outputs (List[AlignedMeshOutput]): the mesh outputs list.
-
-        """
 
         outputs = []
 
@@ -316,19 +269,6 @@ class AlignedShapeAsLatentPLModule(pl.LightningModule):
                     octree_depth: int = 7,
                     num_chunks: int = 10000) -> List[Latent2MeshOutput]:
 
-        """
-
-        Args:
-            latents: [bs, num_latents, dim]
-            bounds:
-            octree_depth:
-            num_chunks:
-
-        Returns:
-            mesh_outputs (List[MeshOutput]): the mesh outputs list.
-
-        """
-
         outputs = []
 
         geometric_func = partial(self.shape_model.query_geometry, latents=latents)
@@ -358,4 +298,3 @@ class AlignedShapeAsLatentPLModule(pl.LightningModule):
             outputs.append(out)
 
         return outputs
-
