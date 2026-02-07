@@ -1,0 +1,257 @@
+#!/bin/bash
+#SBATCH --job-name=can3tok_3modes
+#SBATCH --partition=gpu_h100
+#SBATCH --gpus=1
+#SBATCH --time=12:00:00
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=9
+#SBATCH --mem=64G
+#SBATCH --output=logs/can3tok_3modes_%j.out
+#SBATCH --error=logs/can3tok_3modes_%j.err
+
+# ============================================================================
+# HEADER
+# ============================================================================
+echo "================================================================================"
+echo "                  CAN3TOK TRAINING - THREE SEMANTIC MODES"
+echo "================================================================================"
+echo "Job ID: $SLURM_JOB_ID"
+echo "Node: $SLURM_NODELIST"
+echo "Start time: $(date)"
+echo ""
+
+# ============================================================================
+# CONFIGURATION
+# ============================================================================
+
+# Weights & Biases
+export WANDB_API_KEY="your_key_here"
+USE_WANDB=False
+
+# Training Hyperparameters
+BATCH_SIZE=64
+NUM_EPOCHS=200
+LEARNING_RATE=1e-4
+KL_WEIGHT=1e-3
+RECON_SCALE=1.0
+EVAL_EVERY=20
+FAILURE_THRESHOLD=100
+
+# Dataset Configuration
+TRAIN_SCENES=600
+VAL_SCENES=50
+SAMPLING_METHOD="opacity"
+
+# ============================================================================
+# SEMANTIC LOSS CONFIGURATION
+# ============================================================================
+SEMANTIC_MODE="hidden"     # OPTIONS: 'hidden', 'geometric', 'attention'
+SEGMENT_WEIGHT=1.0           # β - segment-level contrastive loss
+INSTANCE_WEIGHT=0.0          # γ - instance-level contrastive loss
+SEMANTIC_TEMP=0.07           # τ - temperature for InfoNCE
+SEMANTIC_SUBSAMPLE=40000      # Subsample Gaussians for efficiency
+
+# ============================================================================
+# PRINT CONFIGURATION SUMMARY
+# ============================================================================
+echo "════════════════════════════════════════════════════════════════════════════════"
+echo "                           CONFIGURATION SUMMARY"
+echo "════════════════════════════════════════════════════════════════════════════════"
+echo ""
+
+# Job Info
+echo "📋 JOB INFORMATION:"
+echo "   Job ID:            $SLURM_JOB_ID"
+echo "   Partition:         $SLURM_JOB_PARTITION"
+echo "   Node:              $SLURM_NODELIST"
+echo "   GPUs:              $SLURM_GPUS"
+echo "   CPUs:              $SLURM_CPUS_PER_TASK"
+echo "   Memory:            64GB"
+echo "   Time Limit:        12:00:00"
+echo ""
+
+# Model Architecture
+echo "🏗️  MODEL ARCHITECTURE:"
+echo "   Reconstruction:    11 geometric params (xyz, opacity, scale, quat)"
+echo "   RGB Status:        ❌ EXCLUDED from reconstruction"
+echo "   Semantic Mode:     ${SEMANTIC_MODE^^}"
+if [ "$SEMANTIC_MODE" = "hidden" ]; then
+    echo "      └─ Approach:  Hidden state → MLP projection"
+    echo "      └─ Flow:      Hidden [B,1024] → 3-layer MLP → [B,40k,32]"
+    echo "      └─ Params:    ~33M parameters"
+elif [ "$SEMANTIC_MODE" = "geometric" ]; then
+    echo "      └─ Approach:  Geometric Gaussians → MLP projection (SimCLR-style)"
+    echo "      └─ Flow:      Gaussians [B,40k,11] → 3-layer MLP → [B,40k,32]"
+    echo "      └─ Params:    ~0.02M parameters"
+    echo "      └─ Note:      ⭐ RECOMMENDED - most standard approach"
+elif [ "$SEMANTIC_MODE" = "attention" ]; then
+    echo "      └─ Approach:  Cross-attention semantic head"
+    echo "      └─ Flow:      Positions [B,40k,3] × Tokens [B,512,384] → [B,40k,32]"
+    echo "      └─ Params:    ~2M parameters"
+    echo "      └─ Note:      Richest semantic conditioning (slower)"
+fi
+echo ""
+
+# Training Parameters
+echo "⚙️  TRAINING HYPERPARAMETERS:"
+echo "   Batch Size:        $BATCH_SIZE"
+echo "   Epochs:            $NUM_EPOCHS"
+echo "   Learning Rate:     $LEARNING_RATE"
+echo "   KL Weight:         $KL_WEIGHT"
+echo "   Recon Scale:       $RECON_SCALE"
+echo "   Eval Every:        $EVAL_EVERY epochs"
+echo "   Failure Thresh:    $FAILURE_THRESHOLD"
+echo ""
+
+# Dataset Configuration
+echo "📊 DATASET CONFIGURATION:"
+echo "   Training Scenes:   $TRAIN_SCENES"
+echo "   Validation Scenes: $VAL_SCENES"
+echo "   Sampling Method:   ${SAMPLING_METHOD^^}"
+if [ "$SAMPLING_METHOD" = "opacity" ]; then
+    echo "      └─ Note:      Importance sampling based on Gaussian opacity"
+elif [ "$SAMPLING_METHOD" = "random" ]; then
+    echo "      └─ Note:      Uniform random sampling"
+fi
+echo "   Data Path:         /home/yli11/scratch/datasets/gaussian_world/preprocessed/interior_gs"
+echo ""
+
+# Semantic Loss Configuration
+echo "🧠 SEMANTIC LOSS CONFIGURATION:"
+if (( $(echo "$SEGMENT_WEIGHT > 0" | bc -l) )) || (( $(echo "$INSTANCE_WEIGHT > 0" | bc -l) )); then
+    echo "   Status:            ✅ ENABLED"
+    echo "   Segment Weight (β): $SEGMENT_WEIGHT"
+    echo "   Instance Weight (γ):$INSTANCE_WEIGHT"
+    echo "   Temperature (τ):    $SEMANTIC_TEMP"
+    echo "   Subsample Size:     $SEMANTIC_SUBSAMPLE Gaussians"
+    echo "   Aggregation:        Mean pooling per category"
+    echo "   Categories:         38 semantic classes (SceneSplat)"
+    echo ""
+    echo "   Loss Composition:"
+    echo "      └─ Total Loss = Recon / $RECON_SCALE + $KL_WEIGHT * KL + Semantic"
+    echo "      └─ Semantic   = $SEGMENT_WEIGHT * Segment + $INSTANCE_WEIGHT * Instance"
+    echo ""
+    if (( $(echo "$SEGMENT_WEIGHT > 0" | bc -l) )); then
+        echo "   📍 Segment Loss (Category-Level Contrastive):"
+        echo "      └─ Aggregates per-Gaussian features by semantic category"
+        echo "      └─ InfoNCE loss on category prototypes"
+        echo "      └─ Encourages same-category Gaussians to cluster"
+    fi
+    if (( $(echo "$INSTANCE_WEIGHT > 0" | bc -l) )); then
+        echo "   📍 Instance Loss (Object-Level Contrastive):"
+        echo "      └─ Aggregates per-Gaussian features by instance ID"
+        echo "      └─ InfoNCE loss on instance prototypes"
+        echo "      └─ Encourages same-object Gaussians to cluster"
+    fi
+else
+    echo "   Status:            ❌ DISABLED"
+    echo "      └─ Training only reconstruction + KL"
+    echo "      └─ No semantic supervision"
+fi
+echo ""
+
+# Logging Configuration
+echo "📈 LOGGING & MONITORING:"
+echo "   Weights & Biases:  $([ "$USE_WANDB" = "True" ] && echo "✅ ENABLED" || echo "❌ DISABLED")"
+if [ "$USE_WANDB" = "True" ]; then
+    echo "      └─ Project:    Can3Tok-3Modes"
+    echo "      └─ Entity:     3D-SSC"
+fi
+echo "   Checkpoints:       Every 10 epochs"
+echo "   Best Model:        Tracked by validation L2 error"
+echo "   Output Log:        logs/can3tok_3modes_${SLURM_JOB_ID}.out"
+echo "   Error Log:         logs/can3tok_3modes_${SLURM_JOB_ID}.err"
+echo "   Save Path:         /home/yli11/scratch/Hafeez_thesis/Can3Tok/checkpoints/job_${SLURM_JOB_ID}_${SEMANTIC_MODE}"
+echo ""
+
+# Expected Performance
+echo "🎯 EXPECTED BEHAVIOR:"
+echo "   Reconstruction:"
+echo "      └─ Initial L2:  ~19,000 (random initialization)"
+echo "      └─ Target L2:   ~10,000-11,000 (converged)"
+echo "      └─ Failure:     L2 > $FAILURE_THRESHOLD"
+if (( $(echo "$SEGMENT_WEIGHT > 0" | bc -l) )); then
+    echo "   Semantic Loss:"
+    echo "      └─ Initial:     ~3.0-5.0 (random features)"
+    echo "      └─ Target:      ~0.5-1.5 (learned clustering)"
+    echo "      └─ ⚠️  WATCH:    Should DECREASE, not collapse to ~0.01"
+fi
+echo ""
+
+echo "════════════════════════════════════════════════════════════════════════════════"
+echo ""
+
+# ============================================================================
+# ENVIRONMENT SETUP
+# ============================================================================
+echo "🔧 Setting up environment..."
+module purge && module load 2023 && module load CUDA/12.1.1
+export PATH="/home/yli11/.conda/envs/can3tok/bin:$PATH"
+export LD_LIBRARY_PATH="/home/yli11/.conda/envs/can3tok/lib/python3.11/site-packages/torch/lib:$LD_LIBRARY_PATH"
+
+cd /home/yli11/scratch/Hafeez_thesis/Can3Tok
+mkdir -p logs checkpoints
+
+echo "   ✓ Modules loaded"
+echo "   ✓ Conda environment: can3tok"
+echo "   ✓ Working directory: $(pwd)"
+echo ""
+
+# W&B setup
+if [ "$USE_WANDB" = "True" ]; then
+    wandb login $WANDB_API_KEY --relogin 2>/dev/null
+    echo "   ✓ Weights & Biases authenticated"
+else
+    echo "   ⊘ Weights & Biases disabled"
+fi
+echo ""
+
+# ============================================================================
+# BUILD TRAINING COMMAND
+# ============================================================================
+echo "🚀 Building training command..."
+
+TRAIN_CMD="python gs_can3tok_2.py"
+TRAIN_CMD="$TRAIN_CMD --batch_size $BATCH_SIZE"
+TRAIN_CMD="$TRAIN_CMD --num_epochs $NUM_EPOCHS"
+TRAIN_CMD="$TRAIN_CMD --lr $LEARNING_RATE"
+TRAIN_CMD="$TRAIN_CMD --kl_weight $KL_WEIGHT"
+TRAIN_CMD="$TRAIN_CMD --eval_every $EVAL_EVERY"
+TRAIN_CMD="$TRAIN_CMD --failure_threshold $FAILURE_THRESHOLD"
+TRAIN_CMD="$TRAIN_CMD --train_scenes $TRAIN_SCENES"
+TRAIN_CMD="$TRAIN_CMD --val_scenes $VAL_SCENES"
+TRAIN_CMD="$TRAIN_CMD --sampling_method $SAMPLING_METHOD"
+TRAIN_CMD="$TRAIN_CMD --recon_scale $RECON_SCALE"
+TRAIN_CMD="$TRAIN_CMD --segment_loss_weight $SEGMENT_WEIGHT"
+TRAIN_CMD="$TRAIN_CMD --instance_loss_weight $INSTANCE_WEIGHT"
+TRAIN_CMD="$TRAIN_CMD --semantic_temperature $SEMANTIC_TEMP"
+TRAIN_CMD="$TRAIN_CMD --semantic_subsample $SEMANTIC_SUBSAMPLE"
+TRAIN_CMD="$TRAIN_CMD --semantic_mode $SEMANTIC_MODE"
+
+if [ "$USE_WANDB" = "True" ]; then
+    TRAIN_CMD="$TRAIN_CMD --use_wandb"
+    TRAIN_CMD="$TRAIN_CMD --wandb_project Can3Tok-3Modes"
+    TRAIN_CMD="$TRAIN_CMD --wandb_entity 3D-SSC"
+fi
+
+echo "Command constructed:"
+echo "$TRAIN_CMD"
+echo ""
+
+# ============================================================================
+# START TRAINING
+# ============================================================================
+echo "════════════════════════════════════════════════════════════════════════════════"
+echo "                          STARTING TRAINING"
+echo "════════════════════════════════════════════════════════════════════════════════"
+echo ""
+
+SECONDS=0
+
+eval $TRAIN_CMD
+TRAIN_EXIT=$?
+
+DURATION=$((SECONDS / 60))
+
+echo ""
+echo "════════════════════════════════════════════════════════════════════════════════"

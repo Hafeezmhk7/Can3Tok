@@ -1,0 +1,44 @@
+#!/bin/bash
+#SBATCH --job-name=inspect_grid_
+#SBATCH --partition=gpu_h100
+#SBATCH --gpus=1
+#SBATCH --time=08:00:00
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=9
+#SBATCH --mem=64G
+#SBATCH --output=logs/inspect_grid_%j.out
+#SBATCH --error=logs/inspect_grid_%j.err
+
+echo "=========================================="
+echo "Grid Dataset Inspection"
+echo "=========================================="
+echo "Job ID: $SLURM_JOB_ID"
+echo "Start time: $(date)"
+echo ""
+
+# Activate conda environment
+export PATH="/home/yli11/.conda/envs/can3tok/bin:$PATH"
+
+# Navigate to project directory
+cd /home/yli11/scratch/Hafeez_thesis/Can3Tok
+
+# Create logs directory
+mkdir -p logs
+
+# Run inspection script
+echo "Running inspection script..."
+echo ""
+
+python inspect_grid_dataset.py
+
+EXIT_CODE=$?
+
+echo ""
+echo "=========================================="
+if [ $EXIT_CODE -eq 0 ]; then
+    echo "✓ Inspection completed successfully!"
+else
+    echo "✗ Inspection failed (exit code: $EXIT_CODE)"
+fi
+echo "=========================================="
+echo "End time: $(date)"
