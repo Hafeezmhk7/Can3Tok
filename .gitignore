@@ -1,0 +1,18 @@
+# Ignore all log files in logs/
+logs/*.out
+logs/*.err
+
+# Ignore all files in logs/ (if you want to ignore everything in logs)
+# logs/*
+
+# Ignore other large files or folders as needed
+*.log
+*.npy
+*.pt
+*.checkpoints
+*.wandb
+*.json
+*.csv
+*.zip
+*.tar.gz
+*.h5
